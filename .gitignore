@@ -1,0 +1,4 @@
+*.pkl
+*.pdb
+*.pyc
+test/*

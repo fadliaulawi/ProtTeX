@@ -38,6 +38,8 @@ def convert_sentence_to_template(user_prompt,input_aatoken,input_protoken):
     return template
 
 def sample(user_prompt,input_aatoken,input_protoken):
+    import time
+    start_time = time.time()
     user_input = convert_sentence_to_template(user_prompt,input_aatoken,input_protoken)
     input_ids = tokenizer.encode(user_input, return_tensors="pt",add_special_tokens=True).to(device)
     input = tokenizer.decode(input_ids[0], skip_special_tokens=True)
@@ -53,9 +55,9 @@ def sample(user_prompt,input_aatoken,input_protoken):
 
     response = generated_text[len(input):].strip()
 
-    # print("User input:",input)
+    print("User input:", input)
     print("Response:",response)
-    
+    print(f"Time elapsed: {time.time() - start_time:.2f} seconds")
     
     return generated_text,response
 
@@ -63,7 +65,7 @@ args = arg_parse()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
-model = AutoModelForCausalLM.from_pretrained(args.model_path,device_map="auto",torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(args.model_path,device_map="auto",torch_dtype=torch.float32)
 
 with open(args.input_protein_pkl, 'rb') as f:
     input_pdb = pkl.load(f)
@@ -78,8 +80,10 @@ with open(args.character_aa_dict, 'rb') as f:
 with open(args.character_protoken, 'rb') as f:
     character_protoken = json.load(f)
     
+print(input_pdb)
+print('AA sequence', aa_sequence)
+print('vq_indexes', vq_indexes)
 input_protoken = "".join([character_protoken[int(i)] for i in vq_indexes])
-
 input_aatoken = "".join([character_aa_dict[i] for i in aa_sequence])
 
 user_prompt = f"Considering the protein structure above, predict its biological function by examining its structural features and comparing it to functionally characterized proteins."

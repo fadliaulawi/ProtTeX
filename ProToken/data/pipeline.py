@@ -512,7 +512,7 @@ def save_pdb_from_aux(aux, filename=None, renum_pdb=True):
       f.write(p_str)
 
 def calculate_tmscore_rmsd(path_1, path_2, 
-                      tmscore_path='/data1/apps/TMalign/TMalign'):
+                      tmscore_path='/home/fadli.ghiffari/.conda/envs/ProtTeX/bin/TMalign'):
     tmscore_result = os.popen(f'{tmscore_path} {path_1} {path_2}').read().splitlines()
     tmlines = [i for i in tmscore_result if i.startswith('TM-score=')]
     rmsdlines = [i for i in tmscore_result if 'RMSD=' in i]
