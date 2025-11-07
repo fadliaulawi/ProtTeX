@@ -104,14 +104,15 @@ class PipelineRunner:
             output_dir=str(self.dirs['results']),
             device='cuda' if self._cuda_available() else 'cpu'
         )
+        split = 'val'
         results = inference.run_inference(
             data_path=self.dirs['tokenized'],
-            split='test',
+            split=split,
             max_new_tokens=256,
             num_samples=-1
         )
         # Save results to JSON
-        inference.save_results(results, split='test')
+        inference.save_results(results, split=split)
         return results
     
     def _cuda_available(self) -> bool:
