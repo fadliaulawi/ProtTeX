@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Heavy data files (users should regenerate)
+data/esm_embeddings.npy
+data/sample_proteins.json
+data/sequences.txt
+data/metadata.txt
+data/embedding_metadata.json
+
+# Logs
+*.log
+demo_output.log
+
+# Environment
+.env
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*~
+.DS_Store

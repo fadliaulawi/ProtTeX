@@ -1,0 +1,165 @@
+================================================================================
+   ESM-2 STRUCTURE TOKENIZER - QUICK REFERENCE CARD
+================================================================================
+
+📁 LOCATION:
+   /lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer/
+
+🚀 TO RUN EVERYTHING:
+   cd /lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer
+   sbatch run_gpu_pipeline.sh
+
+   (Uses conda env: protein_env - automatically activated)
+
+⏱️  TIME: ~1 hour on GPU
+
+================================================================================
+WHAT YOU GET
+================================================================================
+
+✅ Trained Codebook:
+   - 512 structure tokens learned from ESM-2 embeddings
+   - >95% utilization (all tokens used)
+   - File: data/structure_codebook_K512.pkl
+
+✅ Centroid Visualization: ⭐⭐⭐
+   - Shows 512 cluster centers in PCA space
+   - Scatter plot + heatmap
+   - File: data/codebook_centroids.png
+
+✅ Production Tokenizer Class:
+   - File: protein_structure_tokenizer.py
+   - Ready to import and use
+   - Saved version: data/tokenizer_saved/
+
+✅ Complete Examples:
+   - File: 05_tokenizer_usage_example.py
+   - 7 different usage patterns
+
+================================================================================
+TOKENIZER USAGE
+================================================================================
+
+from protein_structure_tokenizer import ProteinStructureTokenizer
+
+# Load
+tokenizer = ProteinStructureTokenizer(
+    codebook_path="data/structure_codebook_K512.pkl"
+)
+
+# Encode
+tokens = tokenizer.encode("MALWMRLLPLLA")
+# → [12, 307, 0, 163, 11, 307, ...]
+#    [M  S287  A  S143  L  S287  ...]
+
+# Decode
+sequence = tokenizer.decode(tokens)
+# → "MALWMRLLPLLA"
+
+================================================================================
+TOKEN FORMAT
+================================================================================
+
+For sequence "MALW":
+
+Position | AA | AA_Token | Structure | Cluster
+---------|----|-----------|-----------|---------
+    0    | M  |    12    |   S287    |   287
+    1    | A  |     0    |   S143    |   143
+    2    | L  |    11    |   S287    |   287
+    3    | W  |    22    |   S056    |    56
+
+Interleaved tokens: [12, 307, 0, 163, 11, 307, 22, 76]
+                     [M  S287  A  S143  L  S287  W  S56]
+
+================================================================================
+VOCABULARY
+================================================================================
+
+Token Range | Type          | Count | Example
+------------|---------------|-------|------------------
+0-19        | Amino acids   | 20    | M=12, A=0, L=11
+20-531      | Structure     | 512   | S000=20, S287=307
+532+        | Special       | 5     | <bos>=532, <eos>=533
+
+Total: 537 tokens
+
+================================================================================
+FILES CREATED
+================================================================================
+
+Pipeline Scripts:
+  01_fetch_sample_data.py          - Fetch from ProteinLMBench
+  02_extract_esm_embeddings.py     - Extract ESM-2 embeddings
+  03_train_kmeans_codebook.py      - Train + visualize centroids ⭐
+  04_tokenize_and_demo.py          - Demo tokenization
+  05_tokenizer_usage_example.py    - Complete examples
+
+Tokenizer Class:
+  protein_structure_tokenizer.py   - Production class (PUSH THIS!)
+
+Job Scripts:
+  run_gpu_pipeline.sh              - SLURM job for full pipeline
+
+Documentation:
+  COMMANDS_TO_RUN.md               - Copy-paste commands ⭐
+  COMPLETE_SUMMARY.md              - What was created
+  TOKENIZER_CLASS_README.md        - For GitHub/HuggingFace
+  START_HERE.md                    - Quick start guide
+
+Output (in data/):
+  structure_codebook_K512.pkl      - Trained codebook
+  codebook_centroids.png           - CENTROID PLOT ⭐
+  tokenizer_saved/                 - Ready to push
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Run pipeline:
+   sbatch run_gpu_pipeline.sh
+
+2. Check results (~1 hour):
+   ls -lh data/
+   display data/codebook_centroids.png
+
+3. Test tokenizer:
+   python 05_tokenizer_usage_example.py
+
+4. Push to GitHub:
+   - Copy protein_structure_tokenizer.py
+   - Copy data/tokenizer_saved/
+   - Copy TOKENIZER_CLASS_README.md as README.md
+   - git push
+
+================================================================================
+VALIDATION
+================================================================================
+
+python -c "
+import sys; sys.path.insert(0, '.')
+from protein_structure_tokenizer import ProteinStructureTokenizer
+t = ProteinStructureTokenizer(codebook_path='data/structure_codebook_K512.pkl')
+seq = 'MALW'
+tokens = t.encode(seq)
+decoded = t.decode(tokens)
+print(f'✅ Works!' if seq == decoded else '❌ Failed')
+"
+
+================================================================================
+HELP
+================================================================================
+
+Stuck? Read:
+  - COMMANDS_TO_RUN.md    (what to run)
+  - GPU_COMMANDS.md       (troubleshooting)
+  - COMPLETE_SUMMARY.md   (overview)
+
+Job status:
+  squeue -u $USER
+
+Logs:
+  tail -f slurm_esm_tokenizer_*.out
+
+================================================================================
+

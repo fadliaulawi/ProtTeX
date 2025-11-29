@@ -1,0 +1,51 @@
+{
+  "n_clusters": 512,
+  "clusters_used": 512,
+  "utilization": 1.0,
+  "n_residues": 42461,
+  "embedding_dim": 1280,
+  "inertia": 1400685.125,
+  "timestamp": "2025-11-25T11:24:27.065719",
+  "top_10_clusters": [
+    {
+      "cluster_id": 397,
+      "count": 908
+    },
+    {
+      "cluster_id": 12,
+      "count": 888
+    },
+    {
+      "cluster_id": 97,
+      "count": 881
+    },
+    {
+      "cluster_id": 12,
+      "count": 865
+    },
+    {
+      "cluster_id": 279,
+      "count": 810
+    },
+    {
+      "cluster_id": 59,
+      "count": 801
+    },
+    {
+      "cluster_id": 279,
+      "count": 793
+    },
+    {
+      "cluster_id": 90,
+      "count": 784
+    },
+    {
+      "cluster_id": 30,
+      "count": 767
+    },
+    {
+      "cluster_id": 146,
+      "count": 734
+    }
+  ]
+}
