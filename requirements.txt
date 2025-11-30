@@ -1,0 +1,28 @@
+# ESM-2 Tokenizer Pipeline Requirements
+# Clean environment - NO TensorFlow!
+
+# PyTorch (install with CUDA support)
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Transformers and HuggingFace
+transformers>=4.30.0
+datasets>=2.14.0
+huggingface-hub>=0.16.0
+
+# BioPython for PDB parsing
+biopython>=1.81
+
+# Machine learning
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0
+
+# NOTE: Do NOT install tensorflow - causes conflicts with PyTorch!
+

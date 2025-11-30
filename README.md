@@ -1,69 +1,140 @@
-# ProtTeX: Structure-In-Context Reasoning and Editing of Proteins with Large Language Models
+# ESMFold/ESM-2 Tokenizer Approach
 
-This is the github repo for the paper Structure-In-Context Reasoning and Editing of Proteins with Large Language Models. An early version is preprinted at [arxiv][https://arxiv.org/abs/2503.08179].
+Alternative tokenizer using pre-trained ESM-2 embeddings instead of hand-crafted 6D features.
 
-<p align="center"><img src="https://github.com/mzc2113391/ProtTeX/blob/main/figs/git_cover.png" width="100%"></p>
+## Status: Proof of Concept Phase
 
-## Installation
+**Goal:** Extract ESM-2 embeddings and test if clustering works better than 6D approach.
 
-ProtTeX is built upon [ProToken](https://github.com/issacAzazel/ProToken.git), we use a slightly modified version of the ProToken repository.
+---
 
-Create a conda environment for ProtTeX:
+## Quick Start (30 minutes)
+
+### Step 1: Extract Embeddings (10-15 min)
 ```bash
-mamba env create -f environment.yaml
+cd /lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer
+python extract_esm_embeddings_sample.py
 ```
-Download the ProToken model param from [Here](https://drive.google.com/file/d/11G4ImYm14f_s2jpqrpyav8jiM25JO3uE/view?usp=sharing) and put it in ./ProToken/ckpts
 
-Download the ProtTeX model param from [Here](https://huggingface.co/mzcwd/ProtTeX) and put it in ./model/ProtTeX
+**What it does:**
+- Loads 10 proteins from AlphaFold dataset
+- Extracts per-residue embeddings using ESM-2 650M
+- Saves to `sample_embeddings.npy`
 
+**Requirements:**
+- transformers
+- torch
+- biopython
 
-## Using ProtTeX
-### function inference
-To infer the function of protein, first tokenize it.
+### Step 2: Test Clustering (5-10 min)
+```bash
+python test_clustering_esm.py
+```
+
+**What it does:**
+- Loads embeddings
+- Runs k-means with K=64 clusters
+- Creates PCA visualization
+- Saves codebook
+
+**Outputs:**
+- `esm_codebook_K64_sample.pkl`
+- `esm_clustering_viz.png`
+- Cluster statistics
+
+### Step 3: Review Results (5 min)
+```bash
+# Check visualization
+display esm_clustering_viz.png
+
+# Compare to 6D approach
+cat sample_metadata.txt
+```
+
+---
+
+## Comparison: 6D vs ESM-2
+
+| Aspect | 6D Hand-Crafted | ESM-2 Embeddings |
+|--------|-----------------|------------------|
+| **Features** | φ, ψ, ω, SS, RSA, density | 1280-dim learned |
+| **Pre-training** | None | 250M sequences |
+| **Dimension** | 6 | 1280 |
+| **Speed** | ⚡ Very fast | 🐌 GPU needed |
+| **Interpretability** | ✅ Clear | ❌ Black box |
+| **Expected quality** | Good | Better |
+
+---
+
+## Files
+
+- `30MIN_PLAN.md` - Detailed 30-minute action plan
+- `extract_esm_embeddings_sample.py` - Extract embeddings from 10 proteins
+- `test_clustering_esm.py` - k-means clustering test
+- `README.md` - This file
+
+---
+
+## Next Steps After 30-Min Test
+
+### If Successful:
+1. Scale to full dataset (8,360 proteins)
+2. Train K=512 codebook
+3. Compare performance on downstream tasks
+
+### If Issues:
+1. Debug environment
+2. Try smaller model (ESM-2 150M)
+3. Fall back to 6D for now
+
+---
+
+## Full Dataset Pipeline (Future)
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-python ./scripts/tokenize.py --pdb_path ./input/input.pdb
+# Extract embeddings from all proteins (~2 hours on A100)
+python extract_esm_embeddings_full.py --num_proteins 8360
+
+# Train full codebook with K=512
+python train_esm_codebook.py --num_clusters 512
+
+# Tokenize proteins
+python tokenize_with_esm.py --input proteins.fasta --output tokens.json
+
+# Fine-tune LLM
+python train_llm.py --tokenizer esm_codebook.pkl
 ```
 
-Then you can run the function inference example
+---
 
-```bash
-python ./scripts/function_inference.py --input_protein_pkl ./input/input_dit_recon.pkl
-#output: The provided protein structure has been assessed, and it is likely to play a role in 3'-5'-RNA exonuclease activity, nucleic acid binding according to its structural characteristics.
-```
+## Model Options
 
-### structure prediction
-To do soon
+### ESM-2 Models (Recommended)
+- `facebook/esm2_t6_8M_UR50D` - 8M params, very fast
+- `facebook/esm2_t12_35M_UR50D` - 35M params, fast
+- `facebook/esm2_t30_150M_UR50D` - 150M params, good balance
+- `facebook/esm2_t33_650M_UR50D` - 650M params, best quality ⭐ (using this)
+- `facebook/esm2_t36_3B_UR50D` - 3B params, highest quality (slow)
 
-### multiconformation sampling
-To do soon
+### ESMFold (Not using for now)
+- Slower (includes structure prediction)
+- Overkill for just embeddings
+- Use ESM-2 instead
 
-### controllable design
-To do soon
+---
 
-## Citation
-```python
-@article{lin2023tokenizing,
-    title={Tokenizing Foldable Protein Structures with Machine-Learned Artificial Amino-Acid Vocabulary},
-    author={Lin, Xiaohan and Chen, Zhenyu and Li, Yanheng and Ma, Zicheng and Fan, Chuanliu and Cao, Ziqiang and Feng, Shihao and Gao, Yi Qin and Zhang, Jun},
-    journal={bioRxiv},
-    pages={2023--11},
-    year={2023},
-    publisher={Cold Spring Harbor Laboratory}
-}
-@article{ma2025prottexstructureincontextreasoningediting,
-      title={ProtTeX: Structure-In-Context Reasoning and Editing of Proteins with Large Language Models}, 
-      author={Zicheng Ma and Chuanliu Fan and Zhicong Wang and Zhenyu Chen and Xiaohan Lin and Yanheng Li and Shihao Feng and Jun Zhang and Ziqiang Cao and Yi Qin Gao},
-      year={2025},
-      journal={arXiv preprint arXiv:2503.08179},
-      eprint={2503.08179},
-      archivePrefix={arXiv},
-      primaryClass={q-bio.BM},
-      url={https://arxiv.org/abs/2503.08179},
-}
-```
+## Resources Needed
+
+### Sample Test (10 proteins):
+- Time: 10-15 minutes
+- GPU: Any CUDA GPU (8GB+ VRAM)
+- Storage: ~50 MB
+
+### Full Dataset (8,360 proteins):
+- Time: 2-3 hours
+- GPU: A100 or similar (40GB+ VRAM)
+- Storage: ~30 GB
 
 
-## Contact
-For questions or further information, please contact [jzhang@cpl.ac.cn](jzhang@cpl.ac.cn).
+
+
