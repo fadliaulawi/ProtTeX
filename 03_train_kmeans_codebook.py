@@ -195,7 +195,7 @@ def main():
     print("=" * 70)
     
     # Configuration
-    DATA_DIR = Path('/lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer/data')
+    DATA_DIR = Path('esmfold_tokenizer/data')
     N_CLUSTERS = 512  # Standard size for structure vocabulary
     
     embeddings_file = DATA_DIR / 'esm_embeddings.npy'

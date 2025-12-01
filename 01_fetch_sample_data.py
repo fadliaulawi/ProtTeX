@@ -17,8 +17,8 @@ def main():
     print("=" * 70)
     
     # Configuration
-    OUTPUT_DIR = Path('/lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer/data')
-    NUM_SAMPLES = 100
+    OUTPUT_DIR = Path('esmfold_tokenizer/data')
+    NUM_SAMPLES = 1000000 # MAXIMUM
     
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     

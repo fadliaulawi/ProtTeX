@@ -71,7 +71,7 @@ def main():
     print("=" * 70)
     
     # Configuration
-    DATA_DIR = Path('/lustrefs/shared/mohammad.sayeed/Prot2Text/esmfold_tokenizer/data')
+    DATA_DIR = Path('esmfold_tokenizer/data')
     MODEL_NAME = "facebook/esm2_t33_650M_UR50D"  # 650M params, 1280-dim embeddings
     
     input_file = DATA_DIR / 'sample_proteins.json'
