@@ -25,4 +25,5 @@ matplotlib>=3.7.0
 tqdm>=4.65.0
 
 # NOTE: Do NOT install tensorflow - causes conflicts with PyTorch!
-
+sacremoses
+wandb
