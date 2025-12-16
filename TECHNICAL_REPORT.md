@@ -23,11 +23,11 @@ Convert continuous protein structure representations into discrete tokens that c
 - **Scale**: ~380,000 proteins per subset
 
 #### 1.2 ESM-2 Embeddings (Script 02)
-- **Model**: ESM-2 (facebook/esm2_t48_15B_UR50D)
+- **Model**: ESM-2 (facebook/esm2_t33_650M_UR50D)
 - **Process**: Extract per-residue embeddings via mean-pooled hidden states
 - **Output**: 
-  - Per-residue embeddings: [seq_len, 5120] (15B model hidden size)
-  - Sequence-level embedding: [5120] (mean-pooled)
+  - Per-residue embeddings: [seq_len, 1280] (650M model hidden size)
+  - Sequence-level embedding: [1280] (mean-pooled)
 - **Purpose**: Provides dense structural representation for clustering
 
 #### 1.3 K-means Tokenizer (Script 03)
@@ -61,8 +61,8 @@ Align tri-modal embeddings (sequence, structure, text) into a shared space for c
 ### Pipeline Components
 
 #### 2.1 Tri-Modal Embedding Extraction (Script 06)
-- **Sequence Embeddings**: ESM-2 (15B) mean-pooled
-  - Dimension: 5120
+- **Sequence Embeddings**: ESM-2 (650M) mean-pooled
+  - Dimension: 1280
 - **Structure Tokens**: Interleaved format from Phase 1
   - Vocabulary: 537
 - **Text Embeddings**: Llama-3.1 (8B) mean-pooled
@@ -73,7 +73,7 @@ Align tri-modal embeddings (sequence, structure, text) into a shared space for c
 ```json
 {
   "protein_id": "UniProt_ID",
-  "sequence_embedding": [5120-dim array],
+  "sequence_embedding": [1280-dim array],
   "structure_tokens": [interleaved token list],
   "text_embedding": [4096-dim array]
 }
@@ -84,7 +84,7 @@ Align tri-modal embeddings (sequence, structure, text) into a shared space for c
 Three independent projection heads map modalities to shared space (4096-dim, Llama-3.1 hidden):
 
 **ProteinProjectionHead** (Sequence)
-- Input: ESM-2 (5120-dim) → MLP → Output: 4096-dim
+- Input: ESM-2 (1280-dim) → MLP → Output: 4096-dim
 - Architecture: Linear → GELU → LayerNorm → Linear
 - Output normalization: L2 normalization
 
@@ -99,21 +99,50 @@ Three independent projection heads map modalities to shared space (4096-dim, Lla
 
 #### 2.3 Tri-Contrastive Loss (Script 07)
 
-**Loss Function** (A2+B1 formulation):
-```
-L_total = α·L_seq↔text + β·L_struct↔text + λ·L_consistency
+**Complete Loss Formulation** (Tri-Modal Contrastive Learning):
 
-where:
-- L_seq↔text = InfoNCE(sequence ↔ text)
-- L_struct↔text = InfoNCE(structure ↔ text)
-- L_consistency = ||seq - struct||² + ||seq - text||² + ||struct - text||²
-```
+Given protein with:
+- Sequence embedding: $\mathbf{s} \in \mathbb{R}^{1280}$
+- Structure tokens: $\mathbf{t} \in \mathbb{Z}^{1024}$  
+- Text description: $\mathbf{x}$
 
-**Weights**:
-- α = 1.0 (sequence-text alignment)
-- β = 1.0 (structure-text alignment)
-- λ = 0.1 (consistency regularization)
-- Temperature: 0.07
+**Step 1: Projection to Shared Space**
+
+Each modality projects independently to 4096-dim shared space:
+
+$$\mathbf{s}_{proj} = \text{norm}(\text{ProteinHead}(\mathbf{s})) \in \mathbb{R}^{4096}$$
+
+$$\mathbf{t}_{proj} = \text{norm}(\text{StructureHead}(\mathbf{t})) \in \mathbb{R}^{4096}$$
+
+$$\mathbf{x}_{proj} = \text{norm}(\text{TextHead}(\text{Llama}(\mathbf{x}))) \in \mathbb{R}^{4096}$$
+
+where $\text{norm}(\cdot)$ is L2 normalization.
+
+**Step 2: Pairwise InfoNCE Losses**
+
+Sequence-Text alignment:
+$$L_{s\leftrightarrow x} = \frac{1}{2}\left[L_{st}(\mathbf{s}_{proj}, \mathbf{x}_{proj}) + L_{st}(\mathbf{x}_{proj}, \mathbf{s}_{proj})\right]$$
+
+where symmetric InfoNCE is:
+$$L_{st}(\mathbf{u}, \mathbf{v}) = -\log\frac{\exp(\mathbf{u} \cdot \mathbf{v} / \tau)}{\sum_{i=1}^{B} \exp(\mathbf{u} \cdot \mathbf{v}_i / \tau)}$$
+
+Structure-Text alignment:
+$$L_{t\leftrightarrow x} = \frac{1}{2}\left[L_{st}(\mathbf{t}_{proj}, \mathbf{x}_{proj}) + L_{st}(\mathbf{x}_{proj}, \mathbf{t}_{proj})\right]$$
+
+**Step 3: Consistency Regularization**
+
+All three modalities should collapse to same representation:
+$$L_{cons} = \mathbb{E}\left[\|\mathbf{s}_{proj} - \mathbf{t}_{proj}\|_2^2 + \|\mathbf{s}_{proj} - \mathbf{x}_{proj}\|_2^2 + \|\mathbf{t}_{proj} - \mathbf{x}_{proj}\|_2^2\right]$$
+
+**Step 4: Final Tri-Contrastive Loss**
+
+$$\boxed{L_{total} = \alpha \cdot L_{s\leftrightarrow x} + \beta \cdot L_{t\leftrightarrow x} + \lambda \cdot L_{cons}}$$
+
+**Hyperparameters**:
+- $\alpha = 1.0$ (sequence-text weight)
+- $\beta = 1.0$ (structure-text weight)  
+- $\lambda = 0.1$ (consistency weight)
+- $\tau = 0.07$ (temperature)
 
 **Training Strategy**:
 - Optimizer: AdamW (lr=1e-4, weight_decay=1e-5)
@@ -138,7 +167,7 @@ where:
 
 | Component | Specification |
 |-----------|---------------|
-| **Sequence Encoder** | ESM-2 15B (5120-dim) |
+| **Sequence Encoder** | ESM-2 650M (1280-dim) |
 | **Text Encoder** | Llama-3.1 8B (4096-dim) |
 | **Structure Encoder** | K-means (512 clusters) + Tokens (537 vocab) |
 | **Shared Space** | 4096-dim (Llama-3.1 hidden) |
