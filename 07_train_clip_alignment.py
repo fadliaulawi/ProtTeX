@@ -21,6 +21,7 @@ from tqdm import tqdm
 from typing import Dict, Tuple
 import warnings
 import sys
+import argparse
 warnings.filterwarnings('ignore')
 
 import wandb
@@ -131,7 +132,7 @@ class ProteinProjectionHead(nn.Module):
 class StructureProjectionHead(nn.Module):
     """Project structure tokens to Llama-3.1 space (4096-dim)"""
     
-    def __init__(self, vocab_size: int = 537, embedding_dim: int = 256, output_dim: int = LLAMA_HIDDEN_DIM, hidden_dim: int = 2048):
+    def __init__(self, vocab_size: int, embedding_dim: int = 256, output_dim: int = LLAMA_HIDDEN_DIM, hidden_dim: int = 2048):
         super().__init__()
         # Token embedding for structure tokens
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
@@ -180,8 +181,8 @@ class TriModalAlignmentModel(nn.Module):
     """Tri-modal alignment: Sequence + Structure ↔ Text (Llama-3.1)"""
     
     def __init__(self, 
+                 structure_vocab_size: int,          # AA (20) + Struct (k) + Special (5), e.g., 153 or 537
                  sequence_dim: int = 1280,           # ESM-2
-                 structure_vocab_size: int = 537,    # AA (20) + Struct (512) + Special (5)
                  text_dim: int = LLAMA_HIDDEN_DIM,   # Llama-3.1
                  shared_dim: int = LLAMA_HIDDEN_DIM,
                  temperature: float = 0.07):
@@ -381,14 +382,23 @@ def main():
     print("=" * 70)
     
     # Parse command line arguments
-    if len(sys.argv) < 2:
-        print(f"❌ Arguments required!")
-        print(f"   Usage: python 07_train_clip_alignment.py <subset_name>")
-        print(f"   Example: python 07_train_clip_alignment.py UniProt_Function")
-        return
-
-    subset_name = sys.argv[1]
+    parser = argparse.ArgumentParser(description='Train tri-modal alignment model')
+    parser.add_argument('subset_name', type=str, help='Dataset subset name (e.g., UniProt_Function)')
+    parser.add_argument('--k', type=int, default=128, choices=[128, 512],
+                       help='Number of k-means clusters for structure tokens (default: 128)')
+    
+    args = parser.parse_args()
+    
+    subset_name = args.subset_name
+    k_clusters = args.k
+    
+    # Calculate vocabulary size dynamically
+    # Vocab: 0-19 (AA), 20-(20+k-1) (clusters), (20+k)-(20+k+4) (special)
+    vocab_size = 20 + k_clusters + 5
+    
     print(f"\n📌 Subset: {subset_name}")
+    print(f"📌 K-means clusters: {k_clusters}")
+    print(f"📌 Vocabulary size: {vocab_size} (20 AA + {k_clusters} clusters + 5 special tokens)")
     
     # Initialize wandb
     wandb.init(
@@ -397,7 +407,7 @@ def main():
         config={
             'model': 'TriModalAlignmentModel',
             'sequence_encoder': 'ESM-2 (1280-dim)',
-            'structure_encoder': 'Interleaved Tokens (537 vocab)',
+            'structure_encoder': f'Interleaved Tokens ({vocab_size} vocab)',
             'text_encoder': 'Llama-3.1 (4096-dim)',
             'loss': 'Tri-Contrastive (A2+B1)',
             'weights': {'alpha': 1.0, 'beta': 1.0, 'gamma': 0.5, 'lambda': 0.1},
@@ -418,12 +428,13 @@ def main():
     # Config
     config = {
         'sequence_dim': 1280,       # ESM-2
-        'structure_vocab': 537,     # AA (20) + Struct (512) + Special (5)
+        'k_clusters': k_clusters,   # Number of structure clusters
+        'structure_vocab': vocab_size,  # AA (20) + Struct (k) + Special (5)
         'text_dim': LLAMA_HIDDEN_DIM,  # Llama-3.1
         'shared_dim': LLAMA_HIDDEN_DIM,
         'temperature': 0.07,
         'batch_size': 1024,
-        'epochs': 5,
+        'epochs': 50,
         'learning_rate': 1e-4,
         'train_test_split': 0.1,
         'loss_weights': {'alpha': 1.0, 'beta': 1.0, 'gamma': 0.5, 'lambda': 0.1} # seq-text, struct-text, seq-struct, combined
@@ -456,8 +467,8 @@ def main():
     print("=" * 70)
     
     model = TriModalAlignmentModel(
-        sequence_dim=config['sequence_dim'],
         structure_vocab_size=config['structure_vocab'],
+        sequence_dim=config['sequence_dim'],
         text_dim=config['text_dim'],
         shared_dim=config['shared_dim'],
         temperature=config['temperature']
@@ -468,6 +479,9 @@ def main():
     print(f"   Parameters: {total_params:,}")
     print(f"   Sequence projection: {config['sequence_dim']} → {config['shared_dim']}")
     print(f"   Structure projection: Tokens ({config['structure_vocab']}) → {config['shared_dim']}")
+    print(f"      ├─ AA tokens: 0-19 (20 types)")
+    print(f"      ├─ Structure clusters: 20-{19+k_clusters} ({k_clusters} clusters)")
+    print(f"      └─ Special tokens: {20+k_clusters}-{20+k_clusters+4} (5 tokens)")
     print(f"   Text projection: {config['text_dim']} → {config['shared_dim']}")
     print(f"   Shared space: {config['shared_dim']} dims (Llama-3.1)")
     print(f"   Temperature: {config['temperature']}")
@@ -572,6 +586,8 @@ def main():
     print(f"\n🏗️  Model Architecture:")
     print(f"   Sequence (ESM-2):     1280-dim → {config['shared_dim']}-dim (projected + normalized)")
     print(f"   Structure (Tokens):   {config['structure_vocab']} vocab → {config['shared_dim']}-dim (projected + normalized)")
+    print(f"      ├─ K-means clusters: {config['k_clusters']}")
+    print(f"      └─ Token range: [0-19 AA | 20-{19+config['k_clusters']} struct | {20+config['k_clusters']}-{24+config['k_clusters']} special]")
     print(f"   Text (Llama-3.1):     {config['text_dim']}-dim → {config['shared_dim']}-dim (projected + normalized)")
     print(f"   Shared space:         {config['shared_dim']} dimensions (Llama-3.1 hidden)")
     

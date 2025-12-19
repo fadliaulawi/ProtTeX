@@ -11,19 +11,20 @@ from pathlib import Path
 from transformers import AutoTokenizer, EsmModel
 from tqdm import tqdm
 import warnings
+import sys
 warnings.filterwarnings('ignore')
 
 
-def extract_esm_embeddings(sequences, model, tokenizer, device='cuda', batch_size=1):
+def extract_esm_embeddings_batch(sequences, batch_start_idx, model, tokenizer, device='cuda'):
     """
-    Extract per-residue embeddings from ESM-2
+    Extract per-residue embeddings from ESM-2 for a batch of sequences
     
     Args:
-        sequences: List of protein sequences
+        sequences: List of protein sequences for this batch
+        batch_start_idx: Starting protein index for this batch
         model: ESM-2 model
         tokenizer: ESM tokenizer
         device: 'cuda' or 'cpu'
-        batch_size: Batch size (keep at 1 for variable length sequences)
     
     Returns:
         all_embeddings: numpy array [total_residues, hidden_dim]
@@ -34,7 +35,7 @@ def extract_esm_embeddings(sequences, model, tokenizer, device='cuda', batch_siz
     
     model.eval()
     
-    for i, sequence in enumerate(tqdm(sequences, desc="Extracting embeddings")):
+    for i, sequence in enumerate(tqdm(sequences, desc="Extracting embeddings", leave=False)):
         # Tokenize
         inputs = tokenizer([sequence], return_tensors="pt", padding=False, truncation=False)
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -53,15 +54,14 @@ def extract_esm_embeddings(sequences, model, tokenizer, device='cuda', batch_siz
             all_embeddings.append(embeddings)
             
             metadata.append({
-                'protein_idx': i,
+                'protein_idx': batch_start_idx + i,
                 'length': len(sequence),
                 'start_idx': sum(len(e) for e in all_embeddings[:-1]),
                 'end_idx': sum(len(e) for e in all_embeddings)
             })
     
     # Stack all embeddings
-    all_embeddings_stacked = np.vstack(all_embeddings)
-    
+    all_embeddings_stacked = np.vstack(all_embeddings)    
     return all_embeddings_stacked, metadata
 
 
@@ -70,8 +70,23 @@ def main():
     print("EXTRACT ESM-2 EMBEDDINGS")
     print("=" * 70)
     
+    # Parse command line arguments
+    if len(sys.argv) < 2:
+        print(f"❌ Batch number required!")
+        print(f"   Usage: python 02_extract_esm_embeddings.py <batch_number>")
+        print(f"   Example: python 02_extract_esm_embeddings.py 0")
+        return
+    
+    try:
+        batch_to_process = int(sys.argv[1])
+        print(f"\n📌 Processing batch {batch_to_process}")
+    except ValueError:
+        print(f"❌ Invalid batch number: {sys.argv[1]}")
+        print(f"   Usage: python 02_extract_esm_embeddings.py <batch_number>")
+        return
+    
     # Configuration
-    DATA_DIR = Path('esmfold_tokenizer/data')
+    DATA_DIR = Path('esmfold_tokenizer/data/UniProt_Function')
     MODEL_NAME = "facebook/esm2_t33_650M_UR50D"  # 650M params, 1280-dim embeddings
     
     input_file = DATA_DIR / 'sample_proteins.json'
@@ -104,6 +119,11 @@ def main():
         samples = json.load(f)
     
     sequences = [s['sequence'] for s in samples]
+
+    # Shuffle sequences for balanced batches
+    np.random.seed(42)
+    indices = np.random.permutation(len(sequences))
+    sequences = [sequences[i] for i in indices]
     
     print(f"✅ Loaded {len(sequences)} sequences")
     print(f"   Total residues: {sum(len(s) for s in sequences):,}")
@@ -128,64 +148,56 @@ def main():
     
     # Extract embeddings
     print("\n" + "=" * 70)
-    print("STEP 3: Extracting Embeddings")
+    print("STEP 3: Extracting Embeddings (Batch Processing)")
     print("=" * 70)
     
-    embeddings, metadata = extract_esm_embeddings(sequences, model, tokenizer, device)
+    BATCH_SIZE = 10000  # Process 10k sequences per batch
+    num_batches = (len(sequences) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"Processing {len(sequences):,} sequences in {num_batches} batch(es) of {BATCH_SIZE:,}")
     
-    print(f"\n✅ Extraction complete")
-    print(f"   Shape: {embeddings.shape}")
-    print(f"   Size in memory: {embeddings.nbytes / 1024 / 1024:.1f} MB")
+    # Determine which batches to process
+    if batch_to_process < 0 or batch_to_process >= num_batches:
+        print(f"❌ Batch {batch_to_process} out of range [0-{num_batches-1}]")
+        return
+    batches_to_run = [batch_to_process]
     
-    # Statistics
-    print("\n" + "=" * 70)
-    print("STEP 4: Embedding Statistics")
-    print("=" * 70)
+    for batch_num in batches_to_run:
+        start_idx = batch_num * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, len(sequences))
+        batch_sequences = sequences[start_idx:end_idx]
+        
+        print(f"\n{'='*70}")
+        print(f"Batch {batch_num + 1}/{num_batches}: Processing sequences {start_idx:,}-{end_idx:,}")
+        print(f"{'='*70}")
+        
+        # Extract embeddings for this batch
+        from datetime import datetime
+        start = datetime.now()
+
+        embeddings_batch, metadata_batch = extract_esm_embeddings_batch(
+            batch_sequences, start_idx, model, tokenizer, device
+        )
+        
+        print(f"✅ Batch {batch_num + 1} extraction complete")
+        print(f"   Shape: {embeddings_batch.shape}")
+        print(f"   Size in memory: {embeddings_batch.nbytes / 1024 / 1024:.1f} MB")
+        end = datetime.now()
+        print(f"   Extraction time: {(end - start).total_seconds():.2f} seconds")
+        
+        # Save batch data immediately
+        batch_embeddings_file = f"{DATA_DIR}/raw_esm_embeddings/esm_embeddings_batch_{batch_num}.npy"
+        np.save(batch_embeddings_file, embeddings_batch)
+        print(f"✅ Saved batch embeddings: {batch_embeddings_file}")
+        
+        batch_metadata_file = f"{DATA_DIR}/raw_esm_embeddings/embedding_metadata_batch_{batch_num}.json"
+        with open(batch_metadata_file, 'w') as f:
+            json.dump(metadata_batch, f, indent=2)
+        print(f"✅ Saved batch metadata: {batch_metadata_file}")
     
-    print(f"\nEmbedding properties:")
-    print(f"   Shape: {embeddings.shape}")
-    print(f"   Mean: {embeddings.mean():.4f}")
-    print(f"   Std: {embeddings.std():.4f}")
-    print(f"   Min: {embeddings.min():.4f}")
-    print(f"   Max: {embeddings.max():.4f}")
-    
-    # Save results
-    print("\n" + "=" * 70)
-    print("STEP 5: Saving Results")
-    print("=" * 70)
-    
-    # Save embeddings
-    embeddings_file = DATA_DIR / 'esm_embeddings.npy'
-    np.save(embeddings_file, embeddings)
-    print(f"✅ Saved embeddings: {embeddings_file}")
-    print(f"   Size: {embeddings_file.stat().st_size / 1024 / 1024:.1f} MB")
-    
-    # Save metadata
-    metadata_file = DATA_DIR / 'embedding_metadata.json'
-    with open(metadata_file, 'w') as f:
-        json.dump({
-            'model_name': MODEL_NAME,
-            'num_proteins': len(sequences),
-            'total_residues': embeddings.shape[0],
-            'embedding_dim': embeddings.shape[1],
-            'device': device,
-            'protein_metadata': metadata
-        }, f, indent=2)
-    
-    print(f"✅ Saved metadata: {metadata_file}")
-    
-    print("\n" + "=" * 70)
-    print("✅ EMBEDDING EXTRACTION COMPLETE!")
-    print("=" * 70)
-    
-    print(f"\n📊 Summary:")
-    print(f"   Proteins: {len(sequences)}")
-    print(f"   Total residues: {embeddings.shape[0]:,}")
-    print(f"   Embedding dim: {embeddings.shape[1]}")
-    print(f"   File size: {embeddings_file.stat().st_size / 1024 / 1024:.1f} MB")
-    
-    print(f"\n🚀 Next step:")
-    print(f"   python 03_train_kmeans_codebook.py")
+    print(f"\n✅ Batch {batch_to_process} extraction complete!")
+    print(f"\n📌 Individual batch files saved:")
+    print(f"   esm_embeddings_batch_{batch_to_process}.npy")
+    print(f"   embedding_metadata_batch_{batch_to_process}.json")
 
 
 if __name__ == '__main__':

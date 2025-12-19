@@ -15,6 +15,7 @@ from transformers import AutoTokenizer, EsmModel, AutoModel
 from tqdm import tqdm
 import warnings
 import sys
+import argparse
 
 warnings.filterwarnings('ignore')
 
@@ -93,7 +94,7 @@ def extract_text_embedding(text, model, tokenizer, device='cuda'):
     
     return pooled.cpu().numpy()[0]
 
-def extract_structure_tokens(sequence, esm_model, esm_tokenizer, kmeans, device='cuda', token_offset=20, max_length=1024):
+def extract_structure_tokens(sequence, esm_model, esm_tokenizer, kmeans, k_clusters, device='cuda', token_offset=20, max_length=1024):
     """
     Extract per-residue structure tokens interleaved with AA tokens, padded to fixed length.
     
@@ -102,22 +103,24 @@ def extract_structure_tokens(sequence, esm_model, esm_tokenizer, kmeans, device=
         esm_model: ESM-2 model
         esm_tokenizer: ESM-2 tokenizer
         kmeans: Fitted k-means model with cluster centers
+        k_clusters: Number of clusters (e.g., 128 or 512)
         device: 'cuda' or 'cpu'
         token_offset: Offset for structure token IDs (default 20, after AA tokens 0-19)
         max_length: Maximum sequence length for padding (default 1024)
     
     Returns:
-        interleaved_tokens: List of integer token IDs padded to max_length with pad token (532)
+        interleaved_tokens: List of integer token IDs padded to max_length with pad token
     """
-    # AA vocabulary and special tokens (matching tokenizer config)
+    # AA vocabulary and special tokens (dynamically calculated based on k_clusters)
+    # Vocab structure: 0-19 (AA), 20-(20+k-1) (clusters), (20+k)-(20+k+4) (special tokens)
     aa_vocab = "ACDEFGHIKLMNPQRSTVWY"
     aa_to_id = {aa: i for i, aa in enumerate(aa_vocab)}
     special_tokens_dict = {
-        "<pad>": 532,
-        "<unk>": 533,
-        "<bos>": 534,
-        "<eos>": 535,
-        "<sep>": 536,
+        "<pad>": 20 + k_clusters,      # e.g., 148 for k=128, 532 for k=512
+        "<unk>": 20 + k_clusters + 1,
+        "<bos>": 20 + k_clusters + 2,
+        "<eos>": 20 + k_clusters + 3,
+        "<sep>": 20 + k_clusters + 4,
     }
     bos_token_id = special_tokens_dict["<bos>"]
     eos_token_id = special_tokens_dict["<eos>"]
@@ -139,7 +142,7 @@ def extract_structure_tokens(sequence, esm_model, esm_tokenizer, kmeans, device=
     # Assign to nearest clusters
     cluster_ids = kmeans.predict(embeddings)
     
-    # Add token offset to get proper structure token IDs (20-531)
+    # Add token offset to get proper structure token IDs (20 to 20+k_clusters-1)
     structure_tokens = [token_offset + int(cid) for cid in cluster_ids]
     
     # Interleave AA and structure tokens: [AA, Struct, AA, Struct, ...]
@@ -151,7 +154,7 @@ def extract_structure_tokens(sequence, esm_model, esm_tokenizer, kmeans, device=
     # Add special tokens (BOS + tokens + EOS)
     final_tokens = [bos_token_id] + interleaved_tokens + [eos_token_id]
     
-    # Pad to max_length with pad token (532)
+    # Pad to max_length with pad token
     pad_token_id = special_tokens_dict["<pad>"]
     if len(final_tokens) < max_length:
         final_tokens = final_tokens + [pad_token_id] * (max_length - len(final_tokens))
@@ -167,20 +170,26 @@ def main():
     print("=" * 70)
     
     # Parse command line arguments
-    if len(sys.argv) < 3:
-        print(f"❌ Arguments required!")
-        print(f"   Usage: python 06_extract_text_embeddings.py <subset_name> <batch_number>")
-        print(f"   Example: python 06_extract_text_embeddings.py UniProt_Function 0")
-        return
-
-    subset_name = sys.argv[1]
-    try:
-        batch_to_process = int(sys.argv[2])
-        print(f"\n📌 Subset: {subset_name}")
-        print(f"📌 Processing batch {batch_to_process}")
-    except ValueError:
-        print(f"❌ Invalid batch number: {sys.argv[2]}")
-        return
+    parser = argparse.ArgumentParser(description='Extract protein-text embedding pairs with structure tokens')
+    parser.add_argument('subset_name', type=str, help='Dataset subset name (e.g., UniProt_Function)')
+    parser.add_argument('batch_number', type=int, help='Batch number to process (use -1 for all batches)')
+    parser.add_argument('--k', type=int, default=128, choices=[128, 512],
+                       help='Number of k-means clusters for structure tokens (default: 128)')
+    
+    args = parser.parse_args()
+    
+    subset_name = args.subset_name
+    batch_to_process = args.batch_number
+    k_clusters = args.k
+    
+    print(f"\n📌 Subset: {subset_name}")
+    print(f"📌 Processing batch {batch_to_process}")
+    print(f"📌 K-means clusters: {k_clusters}")
+    
+    # Calculate vocabulary size dynamically
+    # Vocab: 0-19 (AA), 20-(20+k-1) (clusters), (20+k)-(20+k+4) (special)
+    vocab_size = 20 + k_clusters + 5
+    print(f"📌 Total vocabulary size: {vocab_size} (20 AA + {k_clusters} clusters + 5 special tokens)")
 
     # Configuration
     DATA_DIR = Path('esmfold_tokenizer/data') / subset_name
@@ -190,7 +199,7 @@ def main():
     LLAMA_MODEL_NAME = "meta-llama/Llama-3.1-8B"
     
     input_file = DATA_DIR / 'sample_proteins.json'
-    codebook_path = DATA_DIR / 'structure_codebook_K512.pkl'
+    codebook_path = DATA_DIR / f'structure_codebook_K{k_clusters}.pkl'
     output_dir = DATA_DIR / 'embedding_pairs'
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -290,7 +299,7 @@ def main():
     # if batch_to_process < 0 or batch_to_process >= num_batches:
     #     print(f"❌ Batch {batch_to_process} out of range [0-{num_batches-1}]")
     #     return
-    
+
     # Determine which batches to process
     batches_to_process = list(range(num_batches)) if batch_to_process == -1 else [batch_to_process]
     print(f"📋 Will process {len(batches_to_process)} batch(es): {batches_to_process}")
@@ -330,7 +339,7 @@ def main():
             struct_tokens = None
             if kmeans is not None:
                 struct_tokens = extract_structure_tokens(
-                    sequence, esm_model, esm_tokenizer, kmeans, device
+                    sequence, esm_model, esm_tokenizer, kmeans, k_clusters, device
                 )
             
             # Create pair
@@ -375,7 +384,9 @@ def main():
             "llama_model": LLAMA_MODEL_NAME,
             "esm_embedding_dim": len(embedding_pairs[0]["sequence_embedding"]) if embedding_pairs else 0,
             "text_embedding_dim": len(embedding_pairs[0]["text_embedding"]) if embedding_pairs else 0,
-            "n_structure_tokens": n_structure_tokens if kmeans else 0
+            "n_structure_tokens": n_structure_tokens if kmeans else 0,
+            "k_clusters": k_clusters,
+            "vocab_size": vocab_size
         }
         
         metadata_file = output_dir / f'metadata_batch_{batch_idx}.json'
@@ -409,7 +420,9 @@ def main():
         print(f"\n📊 Final batch statistics:")
         print(f"  ✅ Sequence embedding (ESM-2 mean-pooled): {metadata['esm_embedding_dim']}D")
         print(f"  ✅ Text embedding (Llama-3.1 mean-pooled): {metadata['text_embedding_dim']}D")
-        print(f"  ✅ Structure tokens (per-residue): {metadata['n_structure_tokens']} clusters (token IDs 20-531)")
+        print(f"  ✅ Structure tokens (per-residue): {metadata['n_structure_tokens']} clusters (token IDs 20-{19+k_clusters})")
+        print(f"  ✅ Special tokens: pad={20+k_clusters}, unk={20+k_clusters+1}, bos={20+k_clusters+2}, eos={20+k_clusters+3}, sep={20+k_clusters+4}")
+        print(f"  ✅ Total vocabulary: {vocab_size} tokens")
 
 
 if __name__ == '__main__':

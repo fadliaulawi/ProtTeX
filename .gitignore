@@ -46,3 +46,4 @@ env/
 esmfold_tokenizer/
 results/
 wandb/
+evaluation_results/

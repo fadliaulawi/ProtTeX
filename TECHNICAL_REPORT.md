@@ -150,16 +150,74 @@ $$\boxed{L_{total} = \alpha \cdot L_{s\leftrightarrow x} + \beta \cdot L_{t\left
 - Gradient clipping: 1.0
 - Epochs: 20 (global) × 39 batches per epoch
 
-#### 2.4 Evaluation (Script 08)
-- **Metrics**: Contrastive retrieval performance
-- **Validation**: Cross-modal similarity ranking
-- **Best Model**: Saved checkpoint from lowest validation loss
+#### 2.4 Llama LoRA Fine-Tuning (Script 08)
+
+**Objective**: Fine-tune Llama-3.1 for protein function prediction using tri-modal reasoning with LoRA adapters.
+
+**Prompt Template Structure** (4-Part Multi-Modal Construction):
+
+The prompt interleaves text and embeddings in a question-answer format:
+
+```
+[Text: Question + Sequence]  →  [Seq Embedding]  →  [Text: Continuation + Structure intro]  →  [Struct Embedding]  →  [Text: Answer intro]  →  [Target: Function]
+     tokenized [len1, 4096]          [1, 4096]              tokenized [len2, 4096]                  [1, 4096]           tokenized [len3]       [len4] (loss only)
+```
+
+**Part Breakdown**:
+1. **Question with Sequence**: `"Given the sequence of {raw_AA_sequence}"`
+2. **Sequence Embedding**: ESM-2 projection (frozen) → [1, 4096]
+3. **Continuation**: `", what is the function? The protein has structure:"`
+4. **Structure Embedding**: Structure token projection (frozen) → [1, 4096]
+5. **Answer Introduction**: `", so the answer is"`
+6. **Target** (training): `" {function_description}"` (only this part contributes to loss)
+
+**Concrete Example**:
+
+```
+Part 1 (Text, tokenized):
+"Given the sequence of MVHLTPEEKSAVTALWGKVNVDEVGGEALGRLLVVYPWTQRFFESFGDLSTPDAVMGNPKVKAHGKKVLGAFSDGLAHLDNLKGTFATLSELHCDKLHVDPENFRLLGNVLVCVLAHHFGKEFTPPVQAAYQKVVAGVANALAHKYH"
+
+Part 2 (Embedding, [1, 4096]):
+<sequence_embedding> [projected ESM-2 representation]
+
+Part 3 (Text, tokenized):
+", what is the function? The protein has structure:"
+
+Part 4 (Embedding, [1, 4096]):
+<structure_embedding> [projected structure token representation]
+
+Part 5 (Text, tokenized):
+", so the answer is"
+
+Part 6 (Text, tokenized, LOSS COMPUTED ONLY HERE):
+" Oxygen transport protein that binds oxygen in the lungs and releases it in peripheral tissues. Contains heme groups that reversibly bind O2. Critical for aerobic respiration in vertebrates."
+```
+
+**Complete Prompt Flow**:
+```
+Given the sequence of MVHLT... <seq_emb>, what is the function? The protein has structure: <struct_emb>, so the answer is [TARGET]
+```
+
+**Reasoning Flow**: Question → Sequence context → Embedding → Structure context → Embedding → Answer
+
+**LoRA Configuration**:
+- Target modules: q_proj, v_proj, k_proj, o_proj
+- Rank r=16, alpha=32, dropout=0.05
+- Trainable params: ~0.1% of Llama-3.1 8B
+- Optimizer: AdamW (lr=2e-4), batch_size=4, epochs=3
+
+**Key Advantages**:
+✅ Raw sequence visible (interpretable) + learned embeddings (powerful)  
+✅ Structure has final say (injected before reasoning prompt)  
+✅ Frozen projections from Phase 2.2 (no retraining needed)  
+✅ Memory efficient (LoRA only trains 0.1% parameters)
 
 ### Phase 2 Summary
-✅ Extracted tri-modal embeddings: sequence (5120D), structure (tokens), text (4096D)  
+✅ Extracted tri-modal embeddings: sequence (1280D), structure (537 tokens), text (4096D)  
 ✅ Designed independent projection heads for modality-specific processing  
 ✅ Implemented tri-contrastive loss aligning all three modalities  
-✅ Achieved joint embedding space for structure-text understanding  
+✅ Fine-tuned Llama with LoRA using multi-part prompt structure  
+✅ Achieved end-to-end protein function prediction pipeline  
 
 ---
 

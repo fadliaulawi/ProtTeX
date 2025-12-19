@@ -368,6 +368,10 @@ References:
     
     args = parser.parse_args()
     
+    batch = args.embeddings.split('_')[-1].split('.')[0]
+    K = os.path.basename(args.codebook).split('_K')[-1].split('.')[0]
+    args.output_dir = os.path.join(args.output_dir, f'K{K}', f'batch_{batch}')
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
