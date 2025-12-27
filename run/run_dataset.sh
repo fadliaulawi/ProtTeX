@@ -1,0 +1,1 @@
+python run/00_standardize_datasets.py > logs/datasets.log 2>&1

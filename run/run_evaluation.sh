@@ -1,0 +1,4 @@
+# python run/06_inference.py --k 128 --input data/triplet_embeddings/triplet_metadata_K128_batch_68.json --output data/evaluation/evaluation_K128_batch_68.json
+# python run/06_inference.py --k 128 --input data/triplet_embeddings/triplet_metadata_K128_batch_69.json --output data/evaluation/evaluation_K128_batch_69.json
+# python run/06_inference.py --k 128 --input data/triplet_embeddings/triplet_metadata_K128_batch_70.json --output data/evaluation/evaluation_K128_batch_70.json
+python run/06_inference.py --k 128 --input data/triplet_embeddings/triplet_metadata_K128_batch_71.json --output data/evaluation/evaluation_K128_batch_71.json
