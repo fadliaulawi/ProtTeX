@@ -55,7 +55,7 @@ torchrun \
     --master_port=$MASTER_PORT \
     run/05_train_lora.py \
     "$@" \
-    > logs/run_ddp_${MODEL_NAME}_$(date +%Y%m%d_%H%M%S).log 2>&1
+    > logs/ddp/run_ddp_${MODEL_NAME}_$(date +%Y%m%d_%H%M%S).log 2>&1
 
 # Alternative with python -m torch.distributed.launch (older style):
 # python -m torch.distributed.launch \

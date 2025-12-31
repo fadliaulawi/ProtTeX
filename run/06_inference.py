@@ -23,21 +23,41 @@ import argparse
 import warnings
 from tqdm import tqdm
 import pickle
+import sys
 warnings.filterwarnings('ignore')
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, EsmModel
 from peft import PeftModel
 from rouge_score import rouge_scorer
 
+# Add root directory to Python path for imports
+script_dir = Path(__file__).parent
+root_dir = script_dir.parent
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
+
+# Import model configuration
+try:
+    from run.config import get_model_config, list_available_models
+except ImportError:
+    # Fallback for direct execution
+    import importlib.util
+    config_path = script_dir / 'config.py'
+    spec = importlib.util.spec_from_file_location("config", config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    get_model_config = config_module.get_model_config
+    list_available_models = config_module.list_available_models
+
 # Embedding dimensions (must match training)
 ESM_HIDDEN_DIM = 2560  # ESM-2 3B
-LLAMA_HIDDEN_DIM = 4096  # Llama-3.1
+# Model hidden dim will be set from config
 
 
 class ProteinProjectionHead(nn.Module):
-    """Project protein embeddings to Llama-3.1 space (4096-dim)"""
+    """Project protein embeddings to model space"""
     
-    def __init__(self, input_dim: int, output_dim: int = LLAMA_HIDDEN_DIM, hidden_dim: int = 2048):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 2048):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -52,9 +72,9 @@ class ProteinProjectionHead(nn.Module):
 
 
 class StructureProjectionHead(nn.Module):
-    """Project structure tokens to Llama-3.1 space (4096-dim)"""
+    """Project structure tokens to model space"""
     
-    def __init__(self, vocab_size: int, embedding_dim: int = 256, output_dim: int = LLAMA_HIDDEN_DIM, hidden_dim: int = 2048):
+    def __init__(self, vocab_size: int, embedding_dim: int = 256, output_dim: int = 4096, hidden_dim: int = 2048):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
         self.proj = nn.Sequential(
@@ -72,9 +92,9 @@ class StructureProjectionHead(nn.Module):
 
 
 class TextProjectionHead(nn.Module):
-    """Project Llama-3.1 text embeddings to shared space"""
+    """Project text embeddings to shared space"""
     
-    def __init__(self, input_dim: int = LLAMA_HIDDEN_DIM, output_dim: int = LLAMA_HIDDEN_DIM):
+    def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
     
@@ -89,8 +109,8 @@ class TriModalAlignmentModel(nn.Module):
     def __init__(self, 
                  structure_vocab_size: int,
                  sequence_dim: int = ESM_HIDDEN_DIM,
-                 text_dim: int = LLAMA_HIDDEN_DIM,
-                 shared_dim: int = LLAMA_HIDDEN_DIM,
+                 text_dim: int = 4096,
+                 shared_dim: int = 4096,
                  temperature: float = 0.07):
         super().__init__()
         
@@ -100,8 +120,6 @@ class TriModalAlignmentModel(nn.Module):
         self.sequence_proj = ProteinProjectionHead(sequence_dim, shared_dim)
         self.structure_proj = StructureProjectionHead(structure_vocab_size, embedding_dim=256, output_dim=shared_dim)
         self.text_proj = TextProjectionHead(text_dim, shared_dim)
-        
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
     
     def forward(self, sequence_emb, structure_tokens):
         """
@@ -110,8 +128,8 @@ class TriModalAlignmentModel(nn.Module):
             structure_tokens: [batch, seq_len] Structure token IDs
         
         Returns:
-            seq_proj: [batch, 4096] Projected sequence embedding
-            struct_proj: [batch, 4096] Projected structure embedding
+            seq_proj: [batch, shared_dim] Projected sequence embedding
+            struct_proj: [batch, shared_dim] Projected structure embedding
         """
         seq_proj = self.sequence_proj(sequence_emb)
         struct_proj = self.structure_proj(structure_tokens)
@@ -122,7 +140,8 @@ class ProteinFunctionInference:
     """End-to-end inference pipeline"""
     
     def __init__(self, 
-                 llama_lora_path: str = None,
+                 model_config,
+                 lora_path: str = None,
                  alignment_model_path: str = None,
                  codebook_path: str = None,
                  k_clusters: int = 128,
@@ -131,7 +150,8 @@ class ProteinFunctionInference:
         Initialize inference pipeline.
         
         Args:
-            llama_lora_path: Path to trained LoRA adapters (final_lora_K{k}), or None to use base model
+            model_config: ModelConfig object with model-specific settings
+            lora_path: Path to trained LoRA adapters (final_lora_K{k}), or None to use base model
             alignment_model_path: Path to CLIP alignment model checkpoint
             codebook_path: Path to k-means codebook (.pkl)
             k_clusters: Number of k-means clusters
@@ -139,6 +159,7 @@ class ProteinFunctionInference:
         """
         self.device = device if torch.cuda.is_available() else "cpu"
         self.k_clusters = k_clusters
+        self.model_config = model_config
         
         print("=" * 70)
         print("INITIALIZING INFERENCE PIPELINE")
@@ -165,11 +186,15 @@ class ProteinFunctionInference:
         with open(alignment_config_path) as f:
             clip_config = json.load(f)
         
+        # Use model_config.hidden_dim for text_dim and shared_dim if not in config
+        text_dim = clip_config.get('text_dim', self.model_config.hidden_dim)
+        shared_dim = clip_config.get('shared_dim', self.model_config.hidden_dim)
+        
         self.alignment_model = TriModalAlignmentModel(
             structure_vocab_size=clip_config['vocab_size'],
             sequence_dim=clip_config['sequence_dim'],
-            text_dim=clip_config['text_dim'],
-            shared_dim=clip_config['shared_dim'],
+            text_dim=text_dim,
+            shared_dim=shared_dim,
             temperature=clip_config['temperature']
         )
         
@@ -179,62 +204,70 @@ class ProteinFunctionInference:
         self.alignment_model.eval()
         print("✅ Alignment model loaded")
         
-        # Load Llama with optional LoRA (use Instruct model to match training)
-        llama_model_name = 'meta-llama/Llama-3.1-8B-Instruct'
-        if llama_lora_path:
-            print(f"\n📥 Loading Llama-3.1-8B-Instruct with LoRA from {llama_lora_path}...")
+        # Load model with optional LoRA (use Instruct model to match training)
+        model_name = self.model_config.model_name
+        if lora_path:
+            print(f"\n📥 Loading {model_name} with LoRA from {lora_path}...")
         else:
-            print(f"\n📥 Loading Llama-3.1-8B base model (no LoRA adapters)...")
+            print(f"\n📥 Loading {model_name} base model (no LoRA adapters)...")
             
-        self.tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=self.model_config.trust_remote_code
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         base_model = AutoModelForCausalLM.from_pretrained(
-            llama_model_name,
+            model_name,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             device_map={"": self.device},
+            trust_remote_code=self.model_config.trust_remote_code
         )
         
         # Try loading LoRA adapters if path provided
-        if llama_lora_path:
+        if lora_path:
             try:
-                self.llama_model = PeftModel.from_pretrained(base_model, llama_lora_path)
+                self.model = PeftModel.from_pretrained(base_model, lora_path)
                 print("✅ LoRA adapters loaded")
             except Exception as e:
                 print(f"⚠️  Warning: Failed to load LoRA adapters: {e}")
                 print("   Using base model without LoRA adapters")
-                self.llama_model = base_model
+                self.model = base_model
         else:
-            self.llama_model = base_model
+            self.model = base_model
             print("✅ Using base model (no LoRA adapters)")
         
-        self.llama_model.eval()
-        self.base_model = self.llama_model.get_base_model()
+        self.model.eval()
+        self.base_model = self.model.get_base_model()
         
         # Unwrap DDP if needed (model might be saved with DDP wrapper)
-        if hasattr(self.llama_model, 'module'):
-            self.llama_model = self.llama_model.module
+        if hasattr(self.model, 'module'):
+            self.model = self.model.module
         if hasattr(self.base_model, 'module'):
             self.base_model = self.base_model.module
         
-        # Load separate Instruct model for plain Llama baseline (completely separate)
-        print(f"\n📥 Loading plain Llama-3.1-8B-Instruct for baseline (separate model)...")
-        self.instruct_model_name = llama_model_name
-        self.instruct_tokenizer = AutoTokenizer.from_pretrained(self.instruct_model_name)
-        if self.instruct_tokenizer.pad_token is None:
-            self.instruct_tokenizer.pad_token = self.instruct_tokenizer.eos_token
+        # Load separate model for plain baseline (completely separate, no LoRA)
+        print(f"\n📥 Loading plain {model_name} for baseline (separate model)...")
+        self.baseline_model_name = model_name
+        self.baseline_tokenizer = AutoTokenizer.from_pretrained(
+            self.baseline_model_name,
+            trust_remote_code=self.model_config.trust_remote_code
+        )
+        if self.baseline_tokenizer.pad_token is None:
+            self.baseline_tokenizer.pad_token = self.baseline_tokenizer.eos_token
         
-        self.instruct_model = AutoModelForCausalLM.from_pretrained(
-            self.instruct_model_name,
+        self.baseline_model = AutoModelForCausalLM.from_pretrained(
+            self.baseline_model_name,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             device_map={"": self.device},
+            trust_remote_code=self.model_config.trust_remote_code
         )
-        self.instruct_model.eval()
+        self.baseline_model.eval()
         
-        print("✅ Both models loaded (tri-modal with LoRA, plain Instruct for baseline)")
+        print("✅ Both models loaded (tri-modal with LoRA, plain model for baseline)")
         
         # AA vocabulary for structure tokens
         self.aa_vocab = "ACDEFGHIKLMNPQRSTVWY"
@@ -244,6 +277,28 @@ class ProteinFunctionInference:
         print("\n" + "=" * 70)
         print("✅ INFERENCE PIPELINE READY")
         print("=" * 70)
+    
+    def _get_stop_token_ids(self, tokenizer):
+        """
+        Get stop token IDs for the model, trying model-specific tokens.
+        
+        Returns:
+            List of stop token IDs
+        """
+        stop_tokens = [tokenizer.eos_token_id]
+        
+        # Try model-specific stop tokens
+        # Llama and DeepSeek use <|eot_id|>
+        eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if eot_token_id is not None and eot_token_id != tokenizer.unk_token_id:
+            stop_tokens.append(eot_token_id)
+        
+        # Qwen uses <|im_end|>
+        im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_end_token_id is not None and im_end_token_id != tokenizer.unk_token_id:
+            stop_tokens.append(im_end_token_id)
+        
+        return stop_tokens
     
     def generate(self, 
                  sequence: str,
@@ -292,43 +347,40 @@ class ProteinFunctionInference:
         with torch.no_grad():
             seq_emb_tensor = torch.tensor(seq_emb, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 2560]
             seq_proj, struct_proj = self.alignment_model(seq_emb_tensor, structure_tokens)
-            seq_proj = seq_proj.to(torch.float16).unsqueeze(1)  # [1, 1, 4096]
-            struct_proj = struct_proj.to(torch.float16).unsqueeze(1)  # [1, 1, 4096]
+            hidden_dim = self.model_config.hidden_dim
+            seq_proj = seq_proj.to(torch.float16).unsqueeze(1)  # [1, 1, hidden_dim]
+            struct_proj = struct_proj.to(torch.float16).unsqueeze(1)  # [1, 1, hidden_dim]
         
-        # Construct prompt with embeddings (Llama 3.1 Instruct chat template)
-        # Part 1: User message header + question + sequence
-        part1 = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{question}\n\nSequence: {sequence}\n"
+        # Construct prompt with embeddings using model-specific format
+        # Use prompt builder but without function_text (for inference)
+        part1, part2, part3, _ = self.model_config.prompt_builder(question, sequence, "")
+        # Remove the function_text part (part4) since we're generating it
+        
         inputs1 = self.tokenizer(part1, return_tensors="pt", add_special_tokens=False).to(self.device)
         emb1 = self.base_model.get_input_embeddings()(inputs1['input_ids'])
         
-        # Part 2: Structure marker (after seq_proj embedding)
-        part2 = "\nStructure: "
         inputs2 = self.tokenizer(part2, return_tensors="pt", add_special_tokens=False).to(self.device)
         emb2 = self.base_model.get_input_embeddings()(inputs2['input_ids'])
         
-        # Part 3: End user turn, start assistant turn
-        part3 = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         inputs3 = self.tokenizer(part3, return_tensors="pt", add_special_tokens=False).to(self.device)
         emb3 = self.base_model.get_input_embeddings()(inputs3['input_ids'])
         
         # Combine embeddings (match training format)
         combined_emb = torch.cat([
-            emb1[0],      # [len1, 4096] - chat header + question + sequence
-            seq_proj[0],  # [1, 4096] - projected sequence embedding
-            emb2[0],      # [len2, 4096] - structure marker
-            struct_proj[0],  # [1, 4096] - projected structure embedding
-            emb3[0]       # [len3, 4096] - assistant turn start
-        ], dim=0).unsqueeze(0)  # [1, total_len, 4096]
+            emb1[0],      # [len1, hidden_dim] - chat header + question + sequence
+            seq_proj[0],  # [1, hidden_dim] - projected sequence embedding
+            emb2[0],      # [len2, hidden_dim] - structure marker
+            struct_proj[0],  # [1, hidden_dim] - projected structure embedding
+            emb3[0]       # [len3, hidden_dim] - assistant turn start
+        ], dim=0).unsqueeze(0)  # [1, total_len, hidden_dim]
         
         attention_mask = torch.ones(combined_emb.shape[1], dtype=torch.long, device=self.device).unsqueeze(0)
         
-        # Generate - use <|eot_id|> as stop token for Llama 3.1 Instruct
-        eos_token_id = self.tokenizer.eos_token_id
-        eot_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        stop_token_ids = [eos_token_id, eot_token_id] if eot_token_id != self.tokenizer.unk_token_id else [eos_token_id]
+        # Generate - get stop tokens for this model
+        stop_token_ids = self._get_stop_token_ids(self.tokenizer)
         
         with torch.no_grad():
-            outputs = self.llama_model.generate(
+            outputs = self.model.generate(
                 inputs_embeds=combined_emb,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
@@ -376,28 +428,26 @@ class ProteinFunctionInference:
         """
         sequence = sequence[:1024]  # Truncate for memory
         
-        # Use proper Llama 3.1 Instruct chat template
+        # Use proper chat template (model-agnostic)
         messages = [
             {"role": "user", "content": f"{question}\n\nSequence: {sequence}"}
         ]
-        prompt = self.instruct_tokenizer.apply_chat_template(
+        prompt = self.baseline_tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=True
         )
         
         # Tokenize
-        inputs = self.instruct_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        inputs = self.baseline_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         
         # Get stop tokens
-        eos_token_id = self.instruct_tokenizer.eos_token_id
-        eot_token_id = self.instruct_tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        stop_token_ids = [eos_token_id, eot_token_id] if eot_token_id != self.instruct_tokenizer.unk_token_id else [eos_token_id]
-        pad_token_id = self.instruct_tokenizer.pad_token_id
+        stop_token_ids = self._get_stop_token_ids(self.baseline_tokenizer)
+        pad_token_id = self.baseline_tokenizer.pad_token_id
         
-        # Use separate instruct model for baseline (completely separate from LoRA model)
+        # Use separate baseline model (completely separate from LoRA model)
         with torch.no_grad():
-            outputs = self.instruct_model.generate(
+            outputs = self.baseline_model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=max(0.1, temperature),
@@ -422,7 +472,7 @@ class ProteinFunctionInference:
             if len(generated_ids) == 0:
                 return ""  # No generation
             
-            generated_text = self.instruct_tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_text = self.baseline_tokenizer.decode(generated_ids, skip_special_tokens=True)
             return generated_text.strip()
         else:
             return ""  # No generation happened
@@ -465,28 +515,26 @@ class ProteinFunctionInference:
         # Convert to space-separated string representation
         structure_str = " ".join([str(int(cid)) for cid in cluster_ids[:512]])  # Limit length
         
-        # Use proper Llama 3.1 Instruct chat template
+        # Use proper chat template (model-agnostic)
         messages = [
             {"role": "user", "content": f"{question}\n\nSequence: {sequence}\n\nStructure: {structure_str}"}
         ]
-        prompt = self.instruct_tokenizer.apply_chat_template(
+        prompt = self.baseline_tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=True
         )
         
         # Tokenize
-        inputs = self.instruct_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        inputs = self.baseline_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         
         # Get stop tokens
-        eos_token_id = self.instruct_tokenizer.eos_token_id
-        eot_token_id = self.instruct_tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        stop_token_ids = [eos_token_id, eot_token_id] if eot_token_id != self.instruct_tokenizer.unk_token_id else [eos_token_id]
-        pad_token_id = self.instruct_tokenizer.pad_token_id
+        stop_token_ids = self._get_stop_token_ids(self.baseline_tokenizer)
+        pad_token_id = self.baseline_tokenizer.pad_token_id
         
-        # Use separate instruct model
+        # Use separate baseline model
         with torch.no_grad():
-            outputs = self.instruct_model.generate(
+            outputs = self.baseline_model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=max(0.1, temperature),
@@ -508,7 +556,7 @@ class ProteinFunctionInference:
             if len(generated_ids) == 0:
                 return ""
             
-            generated_text = self.instruct_tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_text = self.baseline_tokenizer.decode(generated_ids, skip_special_tokens=True)
             return generated_text.strip()
         else:
             return ""
@@ -561,21 +609,23 @@ class ProteinFunctionInference:
         with torch.no_grad():
             seq_emb_tensor = torch.tensor(seq_emb, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 2560]
             seq_proj, struct_proj = self.alignment_model(seq_emb_tensor, structure_tokens)
-            seq_proj = seq_proj.to(torch.float16).unsqueeze(1)  # [1, 1, 4096]
-            struct_proj = struct_proj.to(torch.float16).unsqueeze(1)  # [1, 1, 4096]
+            hidden_dim = self.model_config.hidden_dim
+            seq_proj = seq_proj.to(torch.float16).unsqueeze(1)  # [1, 1, hidden_dim]
+            struct_proj = struct_proj.to(torch.float16).unsqueeze(1)  # [1, 1, hidden_dim]
         
-        # Construct prompt with embeddings (same as fine-tuned version)
-        part1 = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{question}\n\nSequence: {sequence}\n"
-        inputs1 = self.instruct_tokenizer(part1, return_tensors="pt", add_special_tokens=False).to(self.device)
-        emb1 = self.instruct_model.get_input_embeddings()(inputs1['input_ids'])
+        # Construct prompt with embeddings using model-specific format (same as fine-tuned version)
+        # Use prompt builder but without function_text (for inference)
+        part1, part2, part3, _ = self.model_config.prompt_builder(question, sequence, "")
+        # Remove the function_text part (part4) since we're generating it
         
-        part2 = "\nStructure: "
-        inputs2 = self.instruct_tokenizer(part2, return_tensors="pt", add_special_tokens=False).to(self.device)
-        emb2 = self.instruct_model.get_input_embeddings()(inputs2['input_ids'])
+        inputs1 = self.baseline_tokenizer(part1, return_tensors="pt", add_special_tokens=False).to(self.device)
+        emb1 = self.baseline_model.get_input_embeddings()(inputs1['input_ids'])
         
-        part3 = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        inputs3 = self.instruct_tokenizer(part3, return_tensors="pt", add_special_tokens=False).to(self.device)
-        emb3 = self.instruct_model.get_input_embeddings()(inputs3['input_ids'])
+        inputs2 = self.baseline_tokenizer(part2, return_tensors="pt", add_special_tokens=False).to(self.device)
+        emb2 = self.baseline_model.get_input_embeddings()(inputs2['input_ids'])
+        
+        inputs3 = self.baseline_tokenizer(part3, return_tensors="pt", add_special_tokens=False).to(self.device)
+        emb3 = self.baseline_model.get_input_embeddings()(inputs3['input_ids'])
         
         # Combine embeddings
         combined_emb = torch.cat([
@@ -588,32 +638,30 @@ class ProteinFunctionInference:
         
         attention_mask = torch.ones(combined_emb.shape[1], dtype=torch.long, device=self.device).unsqueeze(0)
         
-        # Generate using plain instruct model (not fine-tuned)
-        eos_token_id = self.instruct_tokenizer.eos_token_id
-        eot_token_id = self.instruct_tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        stop_token_ids = [eos_token_id, eot_token_id] if eot_token_id != self.instruct_tokenizer.unk_token_id else [eos_token_id]
+        # Generate using plain baseline model (not fine-tuned)
+        stop_token_ids = self._get_stop_token_ids(self.baseline_tokenizer)
         
         with torch.no_grad():
-            outputs = self.instruct_model.generate(
+            outputs = self.baseline_model.generate(
                 inputs_embeds=combined_emb,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 do_sample=True,
-                pad_token_id=self.instruct_tokenizer.pad_token_id,
+                pad_token_id=self.baseline_tokenizer.pad_token_id,
                 eos_token_id=stop_token_ids,
                 use_cache=True
             )
         
         generated_ids = outputs[0]
-        special_ids = set(stop_token_ids + [self.instruct_tokenizer.pad_token_id])
+        special_ids = set(stop_token_ids + [self.baseline_tokenizer.pad_token_id])
         generated_ids = torch.tensor([t for t in generated_ids.tolist() if t not in special_ids], device=self.device)
         
         if len(generated_ids) == 0:
             return ""
         
-        generated_text = self.instruct_tokenizer.decode(generated_ids, skip_special_tokens=True)
+        generated_text = self.baseline_tokenizer.decode(generated_ids, skip_special_tokens=True)
         return generated_text.strip()
     
     def generate_finetuned_llama_with_structure(self,
@@ -655,7 +703,7 @@ class ProteinFunctionInference:
         # Convert to space-separated string representation
         structure_str = " ".join([str(int(cid)) for cid in cluster_ids[:512]])  # Limit length
         
-        # Use proper Llama 3.1 Instruct chat template
+        # Use proper chat template (model-agnostic)
         messages = [
             {"role": "user", "content": f"{question}\n\nSequence: {sequence}\n\nStructure: {structure_str}"}
         ]
@@ -669,14 +717,12 @@ class ProteinFunctionInference:
         inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         
         # Get stop tokens
-        eos_token_id = self.tokenizer.eos_token_id
-        eot_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        stop_token_ids = [eos_token_id, eot_token_id] if eot_token_id != self.tokenizer.unk_token_id else [eos_token_id]
+        stop_token_ids = self._get_stop_token_ids(self.tokenizer)
         pad_token_id = self.tokenizer.pad_token_id
         
         # Use fine-tuned model (with LoRA adapters)
         with torch.no_grad():
-            outputs = self.llama_model.generate(
+            outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=max(0.1, temperature),
@@ -705,6 +751,9 @@ class ProteinFunctionInference:
 
 def main():
     parser = argparse.ArgumentParser(description='Protein function prediction inference')
+    parser.add_argument('--model', type=str, required=True,
+                       choices=list_available_models(),
+                       help=f'Model type: {", ".join(list_available_models())}')
     parser.add_argument('--k', type=int, default=128, help='K-means clusters (must match training)')
     parser.add_argument('--input', type=str, default='run/input_inference.json', help='Input JSON file: List of objects with "id", "sequence", "question", "function" fields')
     parser.add_argument('--output', type=str, default='run/output_inference.json', help='Output JSON file')
@@ -712,28 +761,60 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
     parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling top-p')
     parser.add_argument('--test-base-only', action='store_true', help='Test base model without LoRA adapters')
+    parser.add_argument('--test-batches', type=int, default=4,
+                       help='Number of last batches held out during training (default: 4)')
+    parser.add_argument('--variants', type=str, default='all',
+                       help='Variants to run (default: all). Options: "all", "1", "2", "3", "4", "5", or comma-separated like "1,3,5"')
+    parser.add_argument('--start-index', type=int, default=None,
+                       help='Start index for processing input list (for parallelization). If None, processes all.')
+    parser.add_argument('--end-index', type=int, default=None,
+                       help='End index for processing input list (for parallelization). If None, processes all.')
+    parser.add_argument('--gpu-id', type=int, default=None,
+                       help='GPU ID for output filename (for parallelization). If None, uses base output filename.')
     
     args = parser.parse_args()
     
+    # Parse variants argument
+    if args.variants.lower() == 'all':
+        variants_to_run = [1, 2, 3, 4, 5]
+    else:
+        try:
+            variants_to_run = [int(v.strip()) for v in args.variants.split(',')]
+            if not all(1 <= v <= 5 for v in variants_to_run):
+                print("❌ Invalid variant numbers. Must be between 1 and 5.")
+                return
+        except ValueError:
+            print(f"❌ Invalid variants format: {args.variants}. Use 'all' or comma-separated numbers like '1,3,5'")
+            return
+    
+    # Get model configuration
+    model_config = get_model_config(args.model)
     k_clusters = args.k
     
-    # Paths
+    # Paths (use model-specific paths)
     data_dir = Path('data')
-    llama_lora_path = data_dir / f'llama_lora/K{k_clusters}_full/final_lora_K{k_clusters}'
-    alignment_model_path = data_dir / f'clip_alignment/K{k_clusters}/best_model_K{k_clusters}.pt'
+    lora_path = data_dir / f'lora/{model_config.output_dir_suffix}/K{k_clusters}_test{args.test_batches}/final_lora_K{k_clusters}'
+    alignment_model_path = data_dir / f'clip_alignment/{args.model}_K{k_clusters}/best_model_K{k_clusters}.pt'
     codebook_path = data_dir / f'structure_codebook_K{k_clusters}.pkl'
+    
+    print(f"=" * 70)
+    print(f"PROTEIN FUNCTION PREDICTION INFERENCE")
+    print(f"=" * 70)
+    print(f"Model: {args.model} ({model_config.model_name})")
+    print(f"K-means clusters: {k_clusters}")
+    print(f"Test batches held out: {args.test_batches}")
     
     # Validate paths (only if not testing base model)
     if not args.test_base_only:
-        if not llama_lora_path.exists():
-            print(f"❌ LoRA model not found: {llama_lora_path}")
-            print(f"   Run script 05_train_llama_lora.py first!")
+        if not lora_path.exists():
+            print(f"❌ LoRA model not found: {lora_path}")
+            print(f"   Run script 05_train_lora.py first with --model {args.model}!")
             print(f"   Or use --test-base-only to test base model without LoRA")
             return
     
     if not alignment_model_path.exists():
         print(f"❌ Alignment model not found: {alignment_model_path}")
-        print(f"   Run script 04_train_clip_alignment.py first!")
+        print(f"   Run script 04_train_clip_alignment.py first with --model {args.model}!")
         return
     
     if not codebook_path.exists():
@@ -765,14 +846,25 @@ def main():
             'ground_truth_function': item.get('function', '')  # For comparison
         })
     
+    # Slice inputs for parallelization if start/end indices provided
+    total_inputs = len(inputs)
+    if args.start_index is not None or args.end_index is not None:
+        start_idx = args.start_index if args.start_index is not None else 0
+        end_idx = args.end_index if args.end_index is not None else len(inputs)
+        inputs = inputs[start_idx:end_idx]
+        print(f"✅ Loaded {total_inputs} total sequences from {args.input}")
+        print(f"📊 Processing subset: indices {start_idx} to {end_idx-1} ({len(inputs)} sequences)")
+    else:
     print(f"✅ Loaded {len(inputs)} sequences from {args.input}")
     
     # Initialize inference pipeline
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"💻 Device: {device}")
+    print(f"🤖 Model: {args.model} ({model_config.model_name})")
     
     pipeline = ProteinFunctionInference(
-        llama_lora_path=str(llama_lora_path),
+        model_config=model_config,
+        lora_path=str(lora_path) if not args.test_base_only else None,
         alignment_model_path=str(alignment_model_path),
         codebook_path=str(codebook_path),
         k_clusters=k_clusters,
@@ -781,6 +873,9 @@ def main():
     
     # Initialize ROUGE scorer
     output_file = Path(args.output)
+    # Modify output filename for parallel execution
+    if args.gpu_id is not None:
+        output_file = output_file.parent / f"{output_file.stem}_gpu{args.gpu_id}{output_file.suffix}"
     output_file.parent.mkdir(parents=True, exist_ok=True)  # Create output directory if needed
     output_file = str(output_file)  # Convert back to string for json.dump
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
@@ -795,12 +890,18 @@ def main():
         'variant5_finetuned_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': []}
     }
     
-    print(f"\n🚀 Running inference (5 variants per sample - Ablation Study)...")
-    print("  Variant 1: Plain Llama (question + sequence) - Baseline")
-    print("  Variant 2: Plain Llama (question + sequence + structure as text)")
-    print("  Variant 3: Plain Llama (question + sequence + structure + embeddings)")
-    print("  Variant 4: Fine-tuned Llama (question + sequence + structure as text, no embeddings)")
-    print("  Variant 5: Fine-tuned Llama (question + sequence + structure + embeddings) - Full Model")
+    print(f"\n🚀 Running inference (Ablation Study)...")
+    print(f"  Model: {args.model} ({model_config.model_name})")
+    print(f"  Variants to run: {', '.join(map(str, variants_to_run))}")
+    variant_descriptions = {
+        1: "Variant 1: Plain model (question + sequence) - Baseline",
+        2: "Variant 2: Plain model (question + sequence + structure as text)",
+        3: "Variant 3: Plain model (question + sequence + structure + embeddings)",
+        4: "Variant 4: Fine-tuned model (question + sequence + structure as text, no embeddings)",
+        5: "Variant 5: Fine-tuned model (question + sequence + structure + embeddings) - Full Model"
+    }
+    for v in variants_to_run:
+        print(f"  {variant_descriptions[v]}")
     
     for item in tqdm(inputs, desc="Processing samples"):
         result = {
@@ -812,7 +913,8 @@ def main():
         
         gt = result.get('ground_truth_function', '')
         
-        # Variant 1: Plain Llama (question + sequence)
+        # Variant 1: Plain model (question + sequence)
+        if 1 in variants_to_run:
         try:
             pred_v1 = pipeline.generate_plain_llama(
                 item['sequence'],
@@ -837,9 +939,13 @@ def main():
         except Exception as e:
             print(f"\n⚠️  Error processing {item['id']} (variant 1): {e}")
             result["predicted_function_variant1"] = f"ERROR: {str(e)}"
+                result['rouge_variant1'] = None
+        else:
+            result["predicted_function_variant1"] = "SKIPPED"
             result['rouge_variant1'] = None
         
-        # Variant 2: Plain Llama (question + sequence + structure)
+        # Variant 2: Plain model (question + sequence + structure)
+        if 2 in variants_to_run:
         try:
             pred_v2 = pipeline.generate_plain_llama_with_structure(
                 item['sequence'],
@@ -864,9 +970,13 @@ def main():
         except Exception as e:
             print(f"\n⚠️  Error processing {item['id']} (variant 2): {e}")
             result["predicted_function_variant2"] = f"ERROR: {str(e)}"
+                result['rouge_variant2'] = None
+        else:
+            result["predicted_function_variant2"] = "SKIPPED"
             result['rouge_variant2'] = None
         
-        # Variant 3: Plain Llama (question + sequence + structure + embeddings)
+        # Variant 3: Plain model (question + sequence + structure + embeddings)
+        if 3 in variants_to_run:
         try:
             pred_v3 = pipeline.generate_plain_llama_with_embeddings(
                 item['sequence'],
@@ -891,9 +1001,13 @@ def main():
         except Exception as e:
             print(f"\n⚠️  Error processing {item['id']} (variant 3): {e}")
             result["predicted_function_variant3"] = f"ERROR: {str(e)}"
+                result['rouge_variant3'] = None
+        else:
+            result["predicted_function_variant3"] = "SKIPPED"
             result['rouge_variant3'] = None
         
-        # Variant 4: Fine-tuned Llama (question + sequence + structure as text, no embeddings)
+        # Variant 4: Fine-tuned model (question + sequence + structure as text, no embeddings)
+        if 4 in variants_to_run:
         try:
             pred_v4 = pipeline.generate_finetuned_llama_with_structure(
                 item['sequence'],
@@ -918,9 +1032,13 @@ def main():
         except Exception as e:
             print(f"\n⚠️  Error processing {item['id']} (variant 4): {e}")
             result["predicted_function_variant4"] = f"ERROR: {str(e)}"
+                result['rouge_variant4'] = None
+        else:
+            result["predicted_function_variant4"] = "SKIPPED"
             result['rouge_variant4'] = None
         
-        # Variant 5: Fine-tuned Llama (question + sequence + structure + embeddings) - Full Model
+        # Variant 5: Fine-tuned model (question + sequence + structure + embeddings) - Full Model
+        if 5 in variants_to_run:
         try:
             pred_v5 = pipeline.generate(
                 item['sequence'],
@@ -945,6 +1063,9 @@ def main():
         except Exception as e:
             print(f"\n⚠️  Error processing {item['id']} (variant 5): {e}")
             result["predicted_function_variant5"] = f"ERROR: {str(e)}"
+                result['rouge_variant5'] = None
+        else:
+            result["predicted_function_variant5"] = "SKIPPED"
             result['rouge_variant5'] = None
         
         # Add to results

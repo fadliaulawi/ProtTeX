@@ -62,17 +62,26 @@ def build_qwen_prompt(question: str, protein_seq: str, function_text: str) -> tu
 
 def build_deepseek_prompt(question: str, protein_seq: str, function_text: str) -> tuple:
     """
-    Build DeepSeek chat template prompt parts.
+    Build DeepSeek-R1-0528-Qwen3-8B chat template prompt parts.
+    
+    DeepSeek-R1-0528-Qwen3-8B is based on Qwen3-8B architecture and uses Qwen chat template format.
+    This is a reasoning model that naturally engages in chain-of-thought reasoning.
+    
+    Important considerations for reasoning models:
+    - Temperature: Recommended 0.6 (as per official documentation)
+    - System prompts are supported
+    - Model naturally performs reasoning without requiring special tokens
+    - Based on Qwen3-8B, so uses Qwen format: <|im_start|>user, <|im_end|>, <|im_start|>assistant, <|im_end|>
     
     Returns:
         (part1, part2, part3, part4) - Four parts of the prompt
     """
-    part1 = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n{question}\n\nSequence: {protein_seq}\n"
+    # Uses Qwen format: <|im_start|>user, <|im_end|>, <|im_start|>assistant, <|im_end|>
+    part1 = f"<|im_start|>user\n{question}\n\nSequence: {protein_seq}\n"
     part2 = "Structure:\n"
-    part3 = "<|end_header_id|><|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-    part4 = f"{function_text}<|eot_id|>"
+    part3 = "<|im_end|>\n<|im_start|>assistant\n"
+    part4 = f"{function_text}<|im_end|>"
     return part1, part2, part3, part4
-
 
 # Model configurations
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
@@ -87,53 +96,23 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     ),
     
     'qwen': ModelConfig(
-        model_name='Qwen/Qwen2.5-7B-Instruct',
+        model_name='Qwen/Qwen3-8B',  # Qwen3-8B is instruction-tuned (Base version is Qwen/Qwen3-8B-Base)
         trust_remote_code=True,
         prompt_builder=build_qwen_prompt,
         output_dir_suffix='qwen',
         wandb_project='prottex-qwen-lora',
         checkpoint_prefix='best_qwen',
-        hidden_dim=3584  # Qwen 2.5 7B uses 3584-dim embeddings
+        hidden_dim=4096  # Qwen3-8B uses 4096-dim embeddings
     ),
     
-    'qwen2.7': ModelConfig(
-        model_name='Qwen/Qwen2.7-7B-Instruct',
-        trust_remote_code=True,
-        prompt_builder=build_qwen_prompt,
-        output_dir_suffix='qwen2.7',
-        wandb_project='prottex-qwen-lora',
-        checkpoint_prefix='best_qwen',
-        hidden_dim=3584  # Qwen 2.7 7B uses 3584-dim embeddings
-    ),
-    
-    'deepseek-v2': ModelConfig(
-        model_name='deepseek-ai/DeepSeek-V2-Chat',
+    'deepseek': ModelConfig(
+        model_name='deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
         trust_remote_code=True,
         prompt_builder=build_deepseek_prompt,
         output_dir_suffix='deepseek',
         wandb_project='prottex-deepseek-lora',
         checkpoint_prefix='best_deepseek',
-        hidden_dim=4096
-    ),
-    
-    'deepseek-r1': ModelConfig(
-        model_name='deepseek-ai/DeepSeek-R1',
-        trust_remote_code=True,
-        prompt_builder=build_deepseek_prompt,
-        output_dir_suffix='deepseek',
-        wandb_project='prottex-deepseek-lora',
-        checkpoint_prefix='best_deepseek',
-        hidden_dim=4096
-    ),
-    
-    'deepseek-r1-distill': ModelConfig(
-        model_name='deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
-        trust_remote_code=True,
-        prompt_builder=build_deepseek_prompt,
-        output_dir_suffix='deepseek',
-        wandb_project='prottex-deepseek-lora',
-        checkpoint_prefix='best_deepseek',
-        hidden_dim=4096
+        hidden_dim=4096  # DeepSeek-R1-0528-Qwen3-8B uses 4096-dim embeddings
     ),
 }
 
@@ -143,7 +122,7 @@ def get_model_config(model_type: str) -> ModelConfig:
     Get configuration for a model type.
     
     Args:
-        model_type: One of 'llama', 'qwen', 'qwen2.7', 'deepseek-v2', 'deepseek-r1', 'deepseek-r1-distill'
+        model_type: One of 'llama', 'qwen', 'deepseek'
     
     Returns:
         ModelConfig object

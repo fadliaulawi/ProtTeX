@@ -9,8 +9,45 @@ import json
 import re
 import random
 import gzip
+import os
 from pathlib import Path
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+
+def get_optimal_workers():
+    """Determine optimal number of workers based on system resources
+    
+    For I/O-bound tasks (file reading), we can use more workers than CPU cores.
+    For CPU-bound tasks (parsing), we should use CPU count.
+    Since we're doing both, use a multiplier for I/O-bound operations.
+    
+    Returns:
+        int: Optimal number of workers
+    """
+    try:
+        # Try to get CPU count
+        cpu_count = os.cpu_count() or 4  # Default to 4 if None
+        
+        # For I/O-bound tasks (file reading), we can use more workers than CPU cores
+        # For CPU-bound tasks (parsing), we should use CPU count
+        # Since we're doing both, use a multiplier for I/O-bound operations
+        if cpu_count <= 16:
+            # Small systems: 2x CPU count, cap at 32
+            optimal = min(cpu_count * 2, 32)
+        elif cpu_count <= 64:
+            # Medium systems: 1.5x CPU count, cap at 96
+            optimal = min(int(cpu_count * 1.5), 96)
+        else:
+            # Large systems (64+ cores): Use CPU count + 32 for I/O overhead
+            optimal = min(cpu_count + 32, 128)  # Cap at 128 for very large systems
+        
+        # DEBUG
+        optimal = 32
+
+        return optimal
+    except Exception:
+        return 8  # Safe default
 
 def extract_sequence_from_input(input_text):
     """Extract protein sequence from various input formats"""
@@ -262,8 +299,7 @@ def process_alphafold_pdb(filepath):
             'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
         }
         
-        sequence = ''.join([aa_map.get(aa, 'X') for aa in seqres_lines])
-        
+        sequence = ''.join([aa_map[aa] for aa in seqres_lines if aa in aa_map])
         return {
             'uniprot_id': uniprot_id,
             'sequence': sequence
@@ -271,7 +307,7 @@ def process_alphafold_pdb(filepath):
     except Exception as e:
         return None
 
-def process_alphafold_structures(alphafold_dir, max_samples=None):
+def process_alphafold_structures(alphafold_dir, max_samples=None, num_workers=8):
     """Process AlphaFold PDB structure files"""
     print(f"\n📖 Processing AlphaFold Structures")
     
@@ -282,36 +318,311 @@ def process_alphafold_structures(alphafold_dir, max_samples=None):
         pdb_files = pdb_files[:max_samples]
     
     print(f"   Found {len(pdb_files)} PDB files")
+    print(f"   Using {num_workers} workers for parallel processing")
     
     samples = []
     valid_count = 0
     skipped = 0
     
-    for pdb_file in tqdm(pdb_files, desc="  Processing PDB files"):
+    def process_single_file(pdb_file):
+        """Process a single PDB file and return result"""
         result = process_alphafold_pdb(pdb_file)
-        
         if not result:
-            skipped += 1
-            continue
+            return None, 'skip_no_result'
         
         sequence = result['sequence']
-        
-        # Skip if sequence is empty or has unknown amino acids
         if not sequence or 'X' in sequence:
-            skipped += 1
-            continue
+            return None, 'skip_invalid'
         
-        samples.append({
-            'id': f'alphafold_{result["uniprot_id"]}_{valid_count:05d}',
+        return {
+            'uniprot_id': result['uniprot_id'],
             'sequence': sequence,
-            'text': '',  # Leave blank as requested
-            'length': len(sequence),
-            'question': '',  # Leave blank as requested
-            'subset': 'AlphaFold/SwissProt_v4',
-            'type': 'PSPD'
-        })
+            'length': len(sequence)
+        }, 'success'
+    
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_single_file, pdb_file): pdb_file for pdb_file in pdb_files}
         
-        valid_count += 1
+        for future in tqdm(as_completed(futures), total=len(pdb_files), desc="  Processing PDB files"):
+            result, status = future.result()
+            
+            if status == 'skip_no_result' or status == 'skip_invalid':
+                skipped += 1
+                continue
+            
+            samples.append({
+                'id': f'alphafold_{result["uniprot_id"]}_{valid_count:05d}',
+                'sequence': result['sequence'],
+                'text': '',  # Leave blank as requested
+                'length': result['length'],
+                'question': '',  # Leave blank as requested
+                'subset': 'AlphaFold/SwissProt_v4',
+                'type': 'PSPD'
+            })
+            
+            valid_count += 1
+    
+    print(f"  ✅ Extracted: {valid_count} samples (skipped: {skipped})")
+    return samples
+
+def process_pspd_alphafold_cif(filepath):
+    """Extract sequence from PSPD AlphaFold CIF file (mmCIF format)"""
+    try:
+        # Extract UniProt ID from filename: AF-A0A0A1GRI8-F1-model_v4.cif or .cif.gz
+        filename = filepath.name
+        # Remove extensions
+        if filename.endswith('.cif'):
+            filename = filename[:-4]  # Remove .cif
+        # Format: AF-A0A0A1GRI8-F1-model_v4
+        parts = filename.split('-')
+        uniprot_id = parts[1] if len(parts) > 1 else filename
+        
+        # Open file (may be gzipped or not)
+        f = open(filepath, 'rt')
+        
+        seq_data = []
+        mon_id_col = -1
+        
+        with f:
+            lines = f.readlines()
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                
+                # Check if we're entering entity_poly_seq loop
+                if line == 'loop_':
+                    # Check next lines for entity_poly_seq column headers
+                    j = i + 1
+                    headers = []
+                    while j < len(lines) and lines[j].strip().startswith('_entity_poly_seq.'):
+                        headers.append(lines[j].strip())
+                        j += 1
+                    
+                    # Check if this is the entity_poly_seq loop
+                    if any('_entity_poly_seq.entity_id' in h or '_entity_poly_seq.num' in h for h in headers):
+                        in_entity_poly_seq_loop = True
+                        # Find mon_id column index
+                        for idx, h in enumerate(headers):
+                            if 'mon_id' in h.lower():
+                                mon_id_col = idx
+                                break
+                        # If not found, assume it's the last column
+                        if mon_id_col == -1:
+                            mon_id_col = len(headers) - 1
+                        
+                        # Now read data lines
+                        k = j
+                        while k < len(lines):
+                            data_line = lines[k].strip()
+                            if not data_line or data_line.startswith('#'):
+                                k += 1
+                                continue
+                            if data_line.startswith('_') or data_line.startswith('loop_'):
+                                break
+                            
+                            parts = data_line.split()
+                            if len(parts) > mon_id_col:
+                                mon_id = parts[mon_id_col].strip('"\'')
+                                seq_data.append(mon_id)
+                            k += 1
+                        
+                        i = k - 1
+                
+                # Fallback: extract from ATOM records if _entity_poly_seq not found
+                if not seq_data and line.startswith('ATOM'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        res_name = parts[3].strip('"\'')  # Residue name (3-letter code)
+                        # Only add if different from last residue (avoid duplicates)
+                        if not seq_data or seq_data[-1] != res_name:
+                            seq_data.append(res_name)
+                
+                i += 1
+        
+        if not seq_data:
+            return None
+        
+        # Convert 3-letter codes to 1-letter codes
+        aa_map = {
+            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+            # Handle modified residues
+            'MSE': 'M', 'SEC': 'C', 'PYL': 'K'
+        }
+        
+        sequence = ''.join([aa_map[aa.upper()] for aa in seq_data if aa.upper() in aa_map])
+        
+        return {
+            'uniprot_id': uniprot_id,
+            'sequence': sequence
+        }
+    except Exception as e:
+        return None
+
+def process_pspd_alphafold_structures(pspd_alphafold_dir, max_samples=None, num_workers=8):
+    """Process PSPD AlphaFold CIF structure files"""
+    print(f"\n📖 Processing PSPD AlphaFold Structures")
+    
+    # Find all CIF files in proteome subdirectories
+    cif_files = []
+    for proteome_dir in sorted(pspd_alphafold_dir.glob('proteome-*')):
+        if proteome_dir.is_dir():
+            # Look for .cif files (ungzipped) or .cif.gz files
+            cif_files.extend(sorted(proteome_dir.glob('*model_v4.cif')))
+    
+    if max_samples:
+        cif_files = cif_files[:max_samples]
+    
+    print(f"   Found {len(cif_files)} CIF files")
+    print(f"   Using {num_workers} workers for parallel processing")
+    
+    samples = []
+    valid_count = 0
+    skipped = 0
+    
+    def process_single_file(cif_file):
+        """Process a single CIF file and return result"""
+        result = process_pspd_alphafold_cif(cif_file)
+        if not result:
+            return None, 'skip_no_result', None
+        
+        sequence = result['sequence']
+        if not sequence or 'X' in sequence:
+            return None, 'skip_invalid', None
+        
+        # Extract proteome name from parent directory
+        proteome_name = cif_file.parent.name
+        
+        return {
+            'uniprot_id': result['uniprot_id'],
+            'sequence': sequence,
+            'length': len(sequence),
+            'proteome_name': proteome_name
+        }, 'success', proteome_name
+    
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_single_file, cif_file): cif_file for cif_file in cif_files}
+        
+        for future in tqdm(as_completed(futures), total=len(cif_files), desc="  Processing CIF files"):
+            result, status, proteome_name = future.result()
+            
+            if status == 'skip_no_result' or status == 'skip_invalid':
+                skipped += 1
+                continue
+            
+            samples.append({
+                'id': f'pspd_alphafold_{result["uniprot_id"]}_{valid_count:05d}',
+                'sequence': result['sequence'],
+                'text': '',  # Leave blank as requested
+                'length': result['length'],
+                'question': '',  # Leave blank as requested
+                'subset': f'PSPD/AlphaFold/{proteome_name}',
+                'type': 'PSPD'
+            })
+            
+            valid_count += 1
+    
+    print(f"  ✅ Extracted: {valid_count} samples (skipped: {skipped})")
+    return samples
+
+def process_pspd_rcsb_pdb(filepath):
+    """Extract sequence from PSPD RCSB PDB file"""
+    try:
+        # Extract PDB ID from filename: 1A00.pdb
+        pdb_id = filepath.stem.upper()
+        
+        with open(filepath, 'rt') as f:
+            seqres_lines = []
+            for line in f:
+                if line.startswith('SEQRES'):
+                    # SEQRES lines contain amino acid 3-letter codes
+                    parts = line.split()
+                    # Skip first 4 fields: SEQRES, serial, chain, count
+                    if len(parts) > 4:
+                        amino_acids = parts[4:]
+                        seqres_lines.extend(amino_acids)
+        
+        if not seqres_lines:
+            return None
+        
+        # Convert 3-letter codes to 1-letter codes
+        aa_map = {
+            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+            # Handle modified residues
+            'MSE': 'M', 'SEC': 'C', 'PYL': 'K'
+        }
+        
+        sequence = ''.join([aa_map[aa] for aa in seqres_lines if aa in aa_map])
+        
+        return {
+            'pdb_id': pdb_id,
+            'sequence': sequence
+        }
+    except Exception as e:
+        return None
+
+def process_pspd_rcsb_structures(pspd_rcsb_dir, max_samples=None, num_workers=8):
+    """Process PSPD RCSB PDB structure files"""
+    print(f"\n📖 Processing PSPD RCSB Structures")
+    
+    # Get all PDB files
+    pdb_files = sorted(pspd_rcsb_dir.glob('*.pdb'))
+    
+    if max_samples:
+        pdb_files = pdb_files[:max_samples]
+    
+    print(f"   Found {len(pdb_files)} PDB files")
+    print(f"   Using {num_workers} workers for parallel processing")
+    
+    samples = []
+    valid_count = 0
+    skipped = 0
+    
+    def process_single_file(pdb_file):
+        """Process a single PDB file and return result"""
+        result = process_pspd_rcsb_pdb(pdb_file)
+        if not result:
+            return None, 'skip_no_result'
+        
+        sequence = result['sequence']
+        if not sequence or 'X' in sequence:
+            return None, 'skip_invalid'
+        
+        return {
+            'pdb_id': result['pdb_id'],
+            'sequence': sequence,
+            'length': len(sequence)
+        }, 'success'
+
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_single_file, pdb_file): pdb_file for pdb_file in pdb_files}
+        
+        for future in tqdm(as_completed(futures), total=len(pdb_files), desc="  Processing PDB files"):
+            result, status = future.result()
+            
+            if status == 'skip_no_result' or status == 'skip_invalid':
+                skipped += 1
+                continue
+            
+            samples.append({
+                'id': f'pspd_rcsb_{result["pdb_id"]}_{valid_count:05d}',
+                'sequence': result['sequence'],
+                'text': '',  # Leave blank as requested
+                'length': result['length'],
+                'question': '',  # Leave blank as requested
+                'subset': 'PSPD/RCSB_PDB',
+                'type': 'PSPD'
+            })
+            
+            valid_count += 1
     
     print(f"  ✅ Extracted: {valid_count} samples (skipped: {skipped})")
     return samples
@@ -327,8 +638,8 @@ def deduplicate_by_sequence(samples):
     seen_seqs = {}
     
     for sample in tqdm(samples, desc="Deduplicating"):
-        # Truncate to first 1022 residues for deduplication
-        seq = sample['sequence'][:1022]  
+        # Truncate to first 2048 residues for deduplication
+        seq = sample['sequence'][:2048]  
         
         if seq not in seen_seqs:
             seen_seqs[seq] = {
@@ -372,16 +683,27 @@ def main():
     print("STANDARDIZE PROTEIN INSTRUCTION DATASETS")
     print("=" * 70)
     
+    # Get number of workers from environment or auto-detect optimal
+    num_workers = get_optimal_workers()
+    cpu_count = os.cpu_count() or 'unknown'
+    print(f"Auto-detected optimal workers: {num_workers} (CPU count: {cpu_count})")
+    print(f"  (Set NUM_WORKERS environment variable to override)")    
+    print(f"Using {num_workers} workers for parallel processing")
+    
     # Define data paths
-    data_dir = Path(__file__).parent.parent / 'data'
+    data_dir = Path(__file__).parent.parent / 'data' / 'datasets'
     proteinlmbench_dir = data_dir / 'proteinlmbench'
     mol_instructions_dir = data_dir / 'mol_instructions_hf' / 'Protein-oriented_Instructions'
     alphafold_dir = data_dir / 'alphafold' / 'swissprot_v4'
+    pspd_alphafold_dir = data_dir / 'pspd' / 'alphafold'
+    pspd_rcsb_dir = data_dir / 'pspd' / 'rcsb_pdb'
     
     # Output path
     output_file = data_dir / 'standardized_protein_instructions.json'
     
     all_samples = []
+    initial_stats_by_subset = {}  # Track stats before deduplication
+    initial_stats_by_type = {}  # Track stats by subtype (PFUD, PSPD, PSAD, PDD)
     
     # Process ProteinLMBench files (only the ones mentioned in README)
     print("\n" + "=" * 70)
@@ -399,6 +721,32 @@ def main():
             json_file = proteinlmbench_dir / subset_file
             if json_file.exists():
                 samples = process_proteinlmbench_file(json_file)
+                # Track initial stats for this subset and type
+                if samples:
+                    subset_name = samples[0]['subset']
+                    dataset_type = samples[0]['type']
+                    lengths = [s['length'] for s in samples]
+                    sorted_lengths = sorted(lengths)
+                    
+                    # Track by subset
+                    initial_stats_by_subset[subset_name] = {
+                        'count': len(samples),
+                        'sequence_length_stats': {
+                            'min': min(lengths),
+                            'max': max(lengths),
+                            'mean': round(sum(lengths)/len(lengths), 1),
+                            'median': sorted_lengths[len(lengths)//2]
+                        }
+                    }
+                    
+                    # Track by type (subtype)
+                    if dataset_type not in initial_stats_by_type:
+                        initial_stats_by_type[dataset_type] = {
+                            'count': 0,
+                            'lengths': []
+                        }
+                    initial_stats_by_type[dataset_type]['count'] += len(samples)
+                    initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
                 all_samples.extend(samples)
             else:
                 print(f"⚠️  File not found: {json_file}")
@@ -417,6 +765,32 @@ def main():
                 continue
             
             samples = process_mol_instructions_file(json_file)
+            # Track initial stats for this subset and type
+            if samples:
+                subset_name = samples[0]['subset']
+                dataset_type = samples[0]['type']
+                lengths = [s['length'] for s in samples]
+                sorted_lengths = sorted(lengths)
+                
+                # Track by subset
+                initial_stats_by_subset[subset_name] = {
+                    'count': len(samples),
+                    'sequence_length_stats': {
+                        'min': min(lengths),
+                        'max': max(lengths),
+                        'mean': round(sum(lengths)/len(lengths), 1),
+                        'median': sorted_lengths[len(lengths)//2]
+                    }
+                }
+                
+                # Track by type (subtype)
+                if dataset_type not in initial_stats_by_type:
+                    initial_stats_by_type[dataset_type] = {
+                        'count': 0,
+                        'lengths': []
+                    }
+                initial_stats_by_type[dataset_type]['count'] += len(samples)
+                initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
             all_samples.extend(samples)
     else:
         print(f"⚠️  Mol-Instructions directory not found: {mol_instructions_dir}")
@@ -428,10 +802,190 @@ def main():
     
     if alphafold_dir.exists():
         # Process AlphaFold (you can limit the number with max_samples parameter)
-        samples = process_alphafold_structures(alphafold_dir, max_samples=None)
+        samples = process_alphafold_structures(alphafold_dir, max_samples=None, num_workers=num_workers)
+        # Track initial stats for this subset and type
+        if samples:
+            subset_name = samples[0]['subset']
+            dataset_type = samples[0]['type']
+            lengths = [s['length'] for s in samples]
+            sorted_lengths = sorted(lengths)
+            
+            # Track by subset
+            initial_stats_by_subset[subset_name] = {
+                'count': len(samples),
+                'sequence_length_stats': {
+                    'min': min(lengths),
+                    'max': max(lengths),
+                    'mean': round(sum(lengths)/len(lengths), 1),
+                    'median': sorted_lengths[len(lengths)//2]
+                }
+            }
+            
+            # Track by type (subtype)
+            if dataset_type not in initial_stats_by_type:
+                initial_stats_by_type[dataset_type] = {
+                    'count': 0,
+                    'lengths': []
+                }
+            initial_stats_by_type[dataset_type]['count'] += len(samples)
+            initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
         all_samples.extend(samples)
     else:
         print(f"⚠️  AlphaFold directory not found: {alphafold_dir}")
+    
+    # Process PSPD AlphaFold structures
+    print("\n" + "=" * 70)
+    print("PROCESSING PSPD ALPHAFOLD STRUCTURES")
+    print("=" * 70)
+    
+    if pspd_alphafold_dir.exists():
+        samples = process_pspd_alphafold_structures(pspd_alphafold_dir, max_samples=None, num_workers=num_workers)
+        # Track initial stats - PSPD AlphaFold may have multiple proteomes
+        if samples:
+            proteome_samples = defaultdict(list)
+            for sample in samples:
+                proteome_samples[sample['subset']].append(sample)
+            
+            for subset_name, subset_samples in proteome_samples.items():
+                dataset_type = subset_samples[0]['type']
+                lengths = [s['length'] for s in subset_samples]
+                sorted_lengths = sorted(lengths)
+                
+                # Track by subset
+                initial_stats_by_subset[subset_name] = {
+                    'count': len(subset_samples),
+                    'sequence_length_stats': {
+                        'min': min(lengths),
+                        'max': max(lengths),
+                        'mean': round(sum(lengths)/len(lengths), 1),
+                        'median': sorted_lengths[len(lengths)//2]
+                    }
+                }
+                
+                # Track by type (subtype)
+                if dataset_type not in initial_stats_by_type:
+                    initial_stats_by_type[dataset_type] = {
+                        'count': 0,
+                        'lengths': []
+                    }
+                initial_stats_by_type[dataset_type]['count'] += len(subset_samples)
+                initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
+        all_samples.extend(samples)
+    else:
+        print(f"⚠️  PSPD AlphaFold directory not found: {pspd_alphafold_dir}")
+    
+    # Process PSPD RCSB structures
+    print("\n" + "=" * 70)
+    print("PROCESSING PSPD RCSB STRUCTURES")
+    print("=" * 70)
+    
+    if pspd_rcsb_dir.exists():
+        samples = process_pspd_rcsb_structures(pspd_rcsb_dir, max_samples=None, num_workers=num_workers)
+        # Track initial stats for this subset and type
+        if samples:
+            subset_name = samples[0]['subset']
+            dataset_type = samples[0]['type']
+            lengths = [s['length'] for s in samples]
+            sorted_lengths = sorted(lengths)
+            
+            # Track by subset
+            initial_stats_by_subset[subset_name] = {
+                'count': len(samples),
+                'sequence_length_stats': {
+                    'min': min(lengths),
+                    'max': max(lengths),
+                    'mean': round(sum(lengths)/len(lengths), 1),
+                    'median': sorted_lengths[len(lengths)//2]
+                }
+            }
+            
+            # Track by type (subtype)
+            if dataset_type not in initial_stats_by_type:
+                initial_stats_by_type[dataset_type] = {
+                    'count': 0,
+                    'lengths': []
+                }
+            initial_stats_by_type[dataset_type]['count'] += len(samples)
+            initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
+        all_samples.extend(samples)
+    else:
+        print(f"⚠️  PSPD RCSB directory not found: {pspd_rcsb_dir}")
+    
+    # Calculate final stats by type
+    initial_stats_by_type_final = {}
+    for dtype, data in initial_stats_by_type.items():
+        lengths = data['lengths']
+        sorted_lengths = sorted(lengths)
+        initial_stats_by_type_final[dtype] = {
+            'count': data['count'],
+            'sequence_length_stats': {
+                'min': min(lengths),
+                'max': max(lengths),
+                'mean': round(sum(lengths)/len(lengths), 1),
+                'median': sorted_lengths[len(lengths)//2]
+            }
+        }
+    
+    # Print initial statistics before deduplication
+    print("\n" + "=" * 70)
+    print("INITIAL STATISTICS (BEFORE DEDUPLICATION)")
+    print("=" * 70)
+    print(f"Total samples: {len(all_samples)}")
+    print("\nInitial stats by subset:")
+    for subset_name, stats in sorted(initial_stats_by_subset.items()):
+        print(f"  {subset_name}: {stats['count']} samples")
+        print(f"    Length - Min: {stats['sequence_length_stats']['min']}, "
+              f"Max: {stats['sequence_length_stats']['max']}, "
+              f"Mean: {stats['sequence_length_stats']['mean']}, "
+              f"Median: {stats['sequence_length_stats']['median']}")
+    
+    print("\nInitial stats by type (subtype):")
+    for dtype, stats in sorted(initial_stats_by_type_final.items()):
+        print(f"  {dtype}: {stats['count']} samples")
+        print(f"    Length - Min: {stats['sequence_length_stats']['min']}, "
+              f"Max: {stats['sequence_length_stats']['max']}, "
+              f"Mean: {stats['sequence_length_stats']['mean']}, "
+              f"Median: {stats['sequence_length_stats']['median']}")
+    
+    # Print formatted tables
+    print("\n" + "=" * 70)
+    print("INITIAL STATISTICS TABLES (BEFORE DEDUPLICATION)")
+    print("=" * 70)
+    
+    # Table 1: By Subset
+    print("\n📊 Statistics by Subset:")
+    print("-" * 70)
+    print(f"{'Subset':<50} {'Count':>15}")
+    print("-" * 70)
+    subset_total = 0
+    for subset_name, stats in sorted(initial_stats_by_subset.items()):
+        count = stats['count']
+        subset_total += count
+        print(f"{subset_name:<50} {count:>15,}")
+    print("-" * 70)
+    print(f"{'TOTAL':<50} {subset_total:>15,}")
+    
+    # Table 2: By Type (Subtype)
+    print("\n📊 Statistics by Type (Subtype):")
+    print("-" * 70)
+    print(f"{'Type':<50} {'Count':>15}")
+    print("-" * 70)
+    type_total = 0
+    for dtype, stats in sorted(initial_stats_by_type_final.items()):
+        count = stats['count']
+        type_total += count
+        # Add description for each type
+        type_desc = {
+            'PFUD': 'Function',
+            'PDD': 'Design',
+            'PSAD': 'Analysis',
+            'PSPD': 'Structure'
+        }
+        desc = type_desc.get(dtype, '')
+        type_label = f"{dtype} ({desc})" if desc else dtype
+        print(f"{type_label:<50} {count:>15,}")
+    print("-" * 70)
+    print(f"{'TOTAL':<50} {type_total:>15,}")
     
     # Deduplicate
     all_samples = deduplicate_by_sequence(all_samples)
@@ -463,7 +1017,6 @@ def main():
     print("=" * 70)
     
     # Count by subset and type
-    from collections import Counter
     subsets = Counter()
     types = Counter()
     
@@ -501,7 +1054,9 @@ def main():
             'max': max(lengths),
             'mean': round(sum(lengths)/len(lengths), 1),
             'median': sorted_lengths[len(lengths)//2]
-        }
+        },
+        'initial_stats_by_subset': initial_stats_by_subset,
+        'initial_stats_by_type': initial_stats_by_type_final
     }
     
     metadata_file = data_dir / 'standardized_protein_instructions_metadata.json'

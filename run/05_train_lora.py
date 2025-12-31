@@ -141,8 +141,6 @@ class TriModalAlignmentModel(nn.Module):
         self.sequence_proj = ProteinProjectionHead(sequence_dim, shared_dim)
         self.structure_proj = StructureProjectionHead(structure_vocab_size, embedding_dim=256, output_dim=shared_dim)
         self.text_proj = TextProjectionHead(text_dim, shared_dim)
-        
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
     
     def forward(self, sequence_emb, structure_tokens):
         """

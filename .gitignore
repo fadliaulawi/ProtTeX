@@ -47,3 +47,5 @@ esmfold_tokenizer/
 results/
 wandb/
 evaluation_results/
+dataset_toolkit/
+gsutil/
