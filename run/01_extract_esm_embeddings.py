@@ -115,7 +115,7 @@ def main():
     DATA_DIR = Path(__file__).parent.parent / 'data'
     MODEL_NAME = "facebook/esmfold_v1"  # ESMFold with structure-aware embeddings, 1280-dim
     
-    input_file = DATA_DIR / 'standardized_protein_instructions.json'
+    input_file = DATA_DIR / 'datasets' / 'standardized_protein_instructions.json'
     output_dir = DATA_DIR / 'esm_embeddings'
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -148,7 +148,8 @@ def main():
     with open(input_file, 'r') as f:
         samples = json.load(f)
     
-    sequences = [s['sequence'] for s in samples]
+    # Extract sequences from new QA/metadata structure
+    sequences = [s['QA']['sequence'] for s in samples]
     
     print(f"✅ Loaded {len(sequences)} sequences")
     print(f"   Total residues: {sum(len(s) for s in sequences):,}")

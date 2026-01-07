@@ -1,86 +1,102 @@
 #!/bin/bash
-# Run 72 batches across 8 GPUs in parallel
+# Flexible script to run ESM embeddings across 8 GPUs in parallel
+# Usage: ./run_esm_embeddings.sh <num_samples> [batch_size]
+# Example: ./run_esm_embeddings.sh 3788499 10000
+
+# Check if number of samples is provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <num_samples> [batch_size]"
+    echo "  num_samples: Total number of samples to process"
+    echo "  batch_size:  Number of samples per batch (default: 10000)"
+    echo ""
+    echo "Example: $0 3788499 10000"
+    exit 1
+fi
+
+NUM_SAMPLES=$1
+BATCH_SIZE=${2:-10000}  # Default to 10000 if not provided
+NUM_GPUS=8
+
+# Calculate number of batches (ceiling division)
+NUM_BATCHES=$(( (NUM_SAMPLES + BATCH_SIZE - 1) / BATCH_SIZE ))
+
+# Calculate batches per GPU (distribute evenly)
+BATCHES_PER_GPU=$(( NUM_BATCHES / NUM_GPUS ))
+REMAINDER=$(( NUM_BATCHES % NUM_GPUS ))
 
 # Create logs directory
-mkdir -p logs
+mkdir -p logs/esm
 
-echo "Starting parallel processing on 8 GPUs..."
-echo "Monitor progress with: tail -f logs/gpu*.log"
+# Clear existing logs
+rm -f logs/esm/gpu*.log
 
-# GPU 0: batches 0-8
-(
-  for i in {0..8}; do
-    echo "GPU 0: Processing batch $i" >> logs/gpu0.log
-    CUDA_VISIBLE_DEVICES=0 python run/01_extract_esm_embeddings.py $i >> logs/gpu0.log 2>&1
-  done
-  echo "GPU 0: DONE!" >> logs/gpu0.log
-) &
+echo "=========================================="
+echo "ESM Embeddings Parallel Processing"
+echo "=========================================="
+echo "Total samples:     $NUM_SAMPLES"
+echo "Batch size:        $BATCH_SIZE"
+echo "Total batches:     $NUM_BATCHES"
+echo "Number of GPUs:    $NUM_GPUS"
+echo "Batches per GPU:   $BATCHES_PER_GPU"
+if [ $REMAINDER -gt 0 ]; then
+    echo "Extra batches:     $REMAINDER (will be distributed to first $REMAINDER GPUs)"
+fi
+echo "=========================================="
+echo ""
+echo "Starting parallel processing on $NUM_GPUS GPUs..."
+echo "Monitor progress with: tail -f logs/esm/gpu*.log"
+echo ""
 
-# GPU 1: batches 9-17
-(
-  for i in {9..17}; do
-    echo "GPU 1: Processing batch $i" >> logs/gpu1.log
-    CUDA_VISIBLE_DEVICES=1 python run/01_extract_esm_embeddings.py $i >> logs/gpu1.log 2>&1
-  done
-  echo "GPU 1: DONE!" >> logs/gpu1.log
-) &
+# Function to launch GPU processing
+launch_gpu() {
+    local gpu_id=$1
+    local start_batch=$2
+    local end_batch=$3
+    
+    (
+        for i in $(seq $start_batch $end_batch); do
+            echo "GPU $gpu_id: Processing batch $i" >> logs/esm/gpu${gpu_id}.log
+            CUDA_VISIBLE_DEVICES=$gpu_id python -u run/01_extract_esm_embeddings.py $i >> logs/esm/gpu${gpu_id}.log 2>&1
+        done
+        echo "GPU $gpu_id: DONE!" >> logs/esm/gpu${gpu_id}.log
+    ) &
+}
 
-# GPU 2: batches 18-26
-(
-  for i in {18..26}; do
-    echo "GPU 2: Processing batch $i" >> logs/gpu2.log
-    CUDA_VISIBLE_DEVICES=2 python run/01_extract_esm_embeddings.py $i >> logs/gpu2.log 2>&1
-  done
-  echo "GPU 2: DONE!" >> logs/gpu2.log
-) &
+# Distribute batches across GPUs
+CURRENT_BATCH=0
+for gpu in $(seq 0 $((NUM_GPUS - 1))); do
+    # Calculate batches for this GPU
+    if [ $gpu -lt $REMAINDER ]; then
+        # First REMAINDER GPUs get one extra batch
+        GPU_BATCHES=$((BATCHES_PER_GPU + 1))
+    else
+        GPU_BATCHES=$BATCHES_PER_GPU
+    fi
+    
+    START_BATCH=$CURRENT_BATCH
+    END_BATCH=$((CURRENT_BATCH + GPU_BATCHES - 1))
+    
+    # Don't exceed total number of batches
+    if [ $END_BATCH -ge $NUM_BATCHES ]; then
+        END_BATCH=$((NUM_BATCHES - 1))
+    fi
+    
+    if [ $START_BATCH -lt $NUM_BATCHES ]; then
+        echo "GPU $gpu: batches $START_BATCH-$END_BATCH ($GPU_BATCHES batches)"
+        launch_gpu $gpu $START_BATCH $END_BATCH
+        CURRENT_BATCH=$((END_BATCH + 1))
+    fi
+done
 
-# GPU 3: batches 27-35
-(
-  for i in {27..35}; do
-    echo "GPU 3: Processing batch $i" >> logs/gpu3.log
-    CUDA_VISIBLE_DEVICES=3 python run/01_extract_esm_embeddings.py $i >> logs/gpu3.log 2>&1
-  done
-  echo "GPU 3: DONE!" >> logs/gpu3.log
-) &
-
-# GPU 4: batches 36-44
-(
-  for i in {36..44}; do
-    echo "GPU 4: Processing batch $i" >> logs/gpu4.log
-    CUDA_VISIBLE_DEVICES=4 python run/01_extract_esm_embeddings.py $i >> logs/gpu4.log 2>&1
-  done
-  echo "GPU 4: DONE!" >> logs/gpu4.log
-) &
-
-# GPU 5: batches 45-53
-(
-  for i in {45..53}; do
-    echo "GPU 5: Processing batch $i" >> logs/gpu5.log
-    CUDA_VISIBLE_DEVICES=5 python run/01_extract_esm_embeddings.py $i >> logs/gpu5.log 2>&1
-  done
-  echo "GPU 5: DONE!" >> logs/gpu5.log
-) &
-
-# GPU 6: batches 54-62
-(
-  for i in {54..62}; do
-    echo "GPU 6: Processing batch $i" >> logs/gpu6.log
-    CUDA_VISIBLE_DEVICES=6 python run/01_extract_esm_embeddings.py $i >> logs/gpu6.log 2>&1
-  done
-  echo "GPU 6: DONE!" >> logs/gpu6.log
-) &
-
-# GPU 7: batches 63-71
-(
-  for i in {63..71}; do
-    echo "GPU 7: Processing batch $i" >> logs/gpu7.log
-    CUDA_VISIBLE_DEVICES=7 python run/01_extract_esm_embeddings.py $i >> logs/gpu7.log 2>&1
-  done
-  echo "GPU 7: DONE!" >> logs/gpu7.log
-) &
+echo ""
+echo "All GPUs launched. Waiting for completion..."
+echo ""
 
 # Wait for all GPUs to finish
 wait
 
-echo "✅ All 72 batches completed!"
-echo "Check logs in: logs/gpu*.log"
+echo ""
+echo "=========================================="
+echo "✅ All $NUM_BATCHES batches completed!"
+echo "=========================================="
+echo "Check logs in: logs/esm/gpu*.log"

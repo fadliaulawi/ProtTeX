@@ -10,44 +10,11 @@ import re
 import random
 import gzip
 import os
+import tarfile
 from pathlib import Path
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-
-def get_optimal_workers():
-    """Determine optimal number of workers based on system resources
-    
-    For I/O-bound tasks (file reading), we can use more workers than CPU cores.
-    For CPU-bound tasks (parsing), we should use CPU count.
-    Since we're doing both, use a multiplier for I/O-bound operations.
-    
-    Returns:
-        int: Optimal number of workers
-    """
-    try:
-        # Try to get CPU count
-        cpu_count = os.cpu_count() or 4  # Default to 4 if None
-        
-        # For I/O-bound tasks (file reading), we can use more workers than CPU cores
-        # For CPU-bound tasks (parsing), we should use CPU count
-        # Since we're doing both, use a multiplier for I/O-bound operations
-        if cpu_count <= 16:
-            # Small systems: 2x CPU count, cap at 32
-            optimal = min(cpu_count * 2, 32)
-        elif cpu_count <= 64:
-            # Medium systems: 1.5x CPU count, cap at 96
-            optimal = min(int(cpu_count * 1.5), 96)
-        else:
-            # Large systems (64+ cores): Use CPU count + 32 for I/O overhead
-            optimal = min(cpu_count + 32, 128)  # Cap at 128 for very large systems
-        
-        # DEBUG
-        optimal = 32
-
-        return optimal
-    except Exception:
-        return 8  # Safe default
 
 def extract_sequence_from_input(input_text):
     """Extract protein sequence from various input formats"""
@@ -130,12 +97,16 @@ def clean_text_by_subset(text):
 
 def get_dataset_type(source, subset_name):
     """Map source and subset to dataset type (PFUD, PDD, PSAD, PSPD)"""
-    # ProteinLMBench mappings (from README)
+    # ProteinLMBench mappings
     if source == 'ProteinLMBench':
-        if 'UniProt Function' in subset_name or 'UniProt_Function' in subset_name:
-            return 'PFUD'
-        elif 'Subunit structure' in subset_name or 'Subunit_structure' in subset_name:
+        # PSAD: Structure analysis
+        if 'Subunit structure' in subset_name or 'Subunit_structure' in subset_name:
             return 'PSAD'
+        # PFUD: All other subsets are function understanding
+        # Including: Function, Induction, Involvement_in_disease, 
+        # Post-translational_modification, Tissue_specificity, Enzyme_CoT
+        else:
+            return 'PFUD'
     
     # Mol-Instructions mappings (from README)
     elif source == 'Mol-Instructions':
@@ -185,11 +156,14 @@ def process_proteinlmbench_file(filepath):
         samples.append({
             'id': f'proteinlmbench_{subset_name.replace(" ", "_")}_{valid_count:05d}',
             'sequence': sequence,
-            'text': text,
+            'answer': text,
             'length': len(sequence),
             'question': question,
             'subset': f'ProteinLMBench/{subset_name}',
-            'type': dataset_type
+            'type': dataset_type,
+            'pdb_id': '',
+            'uniprot_id': '',
+            'accession_id': ''
         })
         
         valid_count += 1
@@ -230,8 +204,8 @@ def process_mol_instructions_file(filepath):
             # Get instruction
             instruction = item.get('instruction', 'Design a protein sequence.')
             
-            # Empty text
-            text = ''
+            # For protein design, answer is the sequence itself
+            answer = sequence
             
             # Combine instruction + specifications as question
             question = f"{instruction}\n{specifications}"
@@ -245,13 +219,17 @@ def process_mol_instructions_file(filepath):
                 continue
             
             # Extract text/output
-            text = item.get('output', '')
+            answer = item.get('output', '')
             
             # Clean text
-            text = clean_text_by_subset(text)
+            answer = clean_text_by_subset(answer)
             
             # Extract question/instruction
             question = item.get('instruction', 'What is the function of this protein?')
+        
+        # Extract protein_accession from metadata if available
+        metadata = item.get('metadata', {})
+        protein_accession = metadata.get('protein_accession', '') if isinstance(metadata, dict) else ''
         
         # Determine dataset type
         dataset_type = get_dataset_type('Mol-Instructions', subset_name)
@@ -259,16 +237,194 @@ def process_mol_instructions_file(filepath):
         samples.append({
             'id': f'mol_instructions_{subset_name.replace(" ", "_")}_{valid_count:05d}',
             'sequence': sequence,
-            'text': text,
+            'answer': answer,
             'length': len(sequence),
             'question': question,
             'subset': f'Mol-Instructions/{subset_name}',
-            'type': dataset_type
+            'type': dataset_type,
+            'pdb_id': '',
+            'uniprot_id': protein_accession if protein_accession else '',
+            'accession_id': ''
         })
         
         valid_count += 1
     
     print(f"  ✅ Extracted: {valid_count} samples (skipped: {skipped})")
+    return samples
+
+def process_afdb_clustered_structures(afdb_clustered_dir, max_samples=None, num_workers=8, ptm_threshold=90.0):
+    """Process AFDB Clustered structure files from batched tar archives, filtered by pTM > threshold"""
+    print(f"\n📖 Processing AFDB Clustered Structures (pTM > {ptm_threshold})")
+    
+    structures_batched_dir = afdb_clustered_dir / 'structures_batched'
+    metrics_batched_dir = afdb_clustered_dir / 'metrics_batched'
+    
+    if not structures_batched_dir.exists():
+        print(f"⚠️  Structures batched directory not found: {structures_batched_dir}")
+        return []
+    
+    if not metrics_batched_dir.exists():
+        print(f"⚠️  Metrics batched directory not found: {metrics_batched_dir}")
+        return []
+    
+    # Get all tar files and corresponding metrics files
+    tar_files = sorted(structures_batched_dir.glob('structures_batch_*.tar'))
+    
+    if not tar_files:
+        print(f"⚠️  No batch tar files found in {structures_batched_dir}")
+        return []
+    
+    print(f"   Found {len(tar_files)} batch tar files")
+    print(f"   Using {num_workers} workers for parallel processing")
+    print(f"   Filtering by pTM > {ptm_threshold}")
+    
+    # Load all metrics first (to match with PDBs by batch and index)
+    print("   Loading metrics files...")
+    all_metrics = {}
+    total_metrics_count = 0
+    metrics_with_ptm = 0
+    for tar_file in tqdm(tar_files, desc="  Loading metrics"):
+        # Extract batch number from tar filename: structures_batch_00042.tar -> 00042
+        batch_num = tar_file.stem.split('_')[-1]
+        metrics_file = metrics_batched_dir / f"metrics_batch_{batch_num}.json"
+        
+        if metrics_file.exists():
+            try:
+                with open(metrics_file, 'r') as f:
+                    batch_metrics = json.load(f)
+                    # Store metrics by batch number and index
+                    all_metrics[batch_num] = batch_metrics
+                    total_metrics_count += len(batch_metrics)
+                    # Count how many have pTM > 90
+                    for m in batch_metrics:
+                        if isinstance(m, dict) and m.get('pTM') is not None:
+                            if isinstance(m['pTM'], (int, float)) and m['pTM'] > 90.0:
+                                metrics_with_ptm += 1
+            except Exception as e:
+                print(f"    Warning: Failed to load {metrics_file}: {e}")
+                all_metrics[batch_num] = []
+        else:
+            all_metrics[batch_num] = []
+    
+    print(f"   Loaded {total_metrics_count:,} metrics entries")
+    print(f"   Found {metrics_with_ptm:,} entries with pTM > 90.0")
+    
+    samples = []
+    valid_count = 0
+    skipped_sequence = 0
+    skipped_ptm = 0
+    
+    def process_single_tar(tar_file):
+        """Process a single tar file and return all valid sequences with pTM filtering"""
+        # Extract batch number
+        batch_num = tar_file.stem.split('_')[-1]
+        batch_metrics = all_metrics.get(batch_num, [])
+        
+        tar_results = []
+        skipped_ptm_count = 0
+        skipped_seq_count = 0
+        len_pdb_names = 0
+        
+        try:
+            with tarfile.open(tar_file, 'r') as tar:
+                pdb_names = [m.name for m in tar.getmembers() if m.name.endswith('.pdb')]
+                len_pdb_names = len(pdb_names)
+                
+                for idx, pdb_name in enumerate(tqdm(pdb_names, desc=f"  {tar_file.name}", leave=False)):
+                    # Get corresponding metric (same index in batch)
+                    metric = batch_metrics[idx] if idx < len(batch_metrics) else {}
+                    
+                    # Check pTM threshold
+                    ptm = metric.get('pTM')
+                    if ptm is None or not isinstance(ptm, (int, float)) or ptm <= ptm_threshold:
+                        skipped_ptm_count += 1
+                        continue
+                    
+                    # Extract sequence directly from tar (don't reopen)
+                    try:
+                        pdb_member = tar.getmember(pdb_name)
+                        pdb_file = tar.extractfile(pdb_member)
+                        if not pdb_file:
+                            skipped_seq_count += 1
+                            continue
+                        
+                        # Extract accession
+                        accession = pdb_name.replace('.pdb', '')
+                        uniprot_id = accession.split('-')[1] if '-' in accession else accession
+                        
+                        # Parse SEQRES lines
+                        seqres_lines = []
+                        for line in pdb_file:
+                            line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                            if line_str.startswith('SEQRES'):
+                                parts = line_str.split()
+                                if len(parts) > 4:
+                                    amino_acids = parts[4:]
+                                    seqres_lines.extend(amino_acids)
+                        
+                        if not seqres_lines:
+                            skipped_seq_count += 1
+                            continue
+                        
+                        # Convert 3-letter codes to 1-letter codes
+                        aa_map = {
+                            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F',
+                            'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LYS': 'K', 'LEU': 'L',
+                            'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q', 'ARG': 'R',
+                            'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+                        }
+                        
+                        sequence = ''.join([aa_map[aa] for aa in seqres_lines if aa in aa_map])
+                        
+                        if not sequence or 'X' in sequence or len(sequence) == 0:
+                            skipped_seq_count += 1
+                            continue
+                        
+                        tar_results.append({
+                            'accession': accession,
+                            'uniprot_id': uniprot_id,
+                            'sequence': sequence,
+                            'length': len(sequence),
+                            'ptm': ptm
+                        })
+                    except Exception as e:
+                        skipped_seq_count += 1
+                        continue
+        except Exception as e:
+            print(f"    Error processing {tar_file.name}: {e}")
+        
+        print(f"")
+        return tar_results, len_pdb_names, skipped_ptm_count, skipped_seq_count
+    
+    # Process tar files in parallel
+    ##DEBUG
+    num_workers = 4
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_single_tar, tar_file): tar_file for tar_file in tar_files}
+        
+        for future in tqdm(as_completed(futures), total=len(tar_files), desc="  Processing tar batches"):
+            tar_results, total_in_tar, batch_skipped_ptm, batch_skipped_seq = future.result()
+            
+            for result in tar_results:
+                samples.append({
+                    'id': f'afdb_clustered_{result["uniprot_id"]}_{valid_count:05d}',
+                    'sequence': result['sequence'],
+                    'answer': '',
+                    'length': result['length'],
+                    'question': '',
+                    'subset': 'AFDB_Clustered/v4',
+                    'type': 'PSPD',
+                    'accession_id': result['accession'],
+                    'uniprot_id': result['uniprot_id'],
+                    'pdb_id': ''
+                })
+                valid_count += 1
+            
+            skipped_ptm += batch_skipped_ptm
+            skipped_sequence += batch_skipped_seq
+    
+    print(f"  ✅ Extracted: {valid_count} samples (pTM > {ptm_threshold})")
+    print(f"  ⚠️  Skipped: {skipped_sequence} (invalid sequence), {skipped_ptm} (pTM <= {ptm_threshold})")
     return samples
 
 def process_alphafold_pdb(filepath):
@@ -354,11 +510,14 @@ def process_alphafold_structures(alphafold_dir, max_samples=None, num_workers=8)
             samples.append({
                 'id': f'alphafold_{result["uniprot_id"]}_{valid_count:05d}',
                 'sequence': result['sequence'],
-                'text': '',  # Leave blank as requested
+                'answer': '',
                 'length': result['length'],
-                'question': '',  # Leave blank as requested
+                'question': '',
                 'subset': 'AlphaFold/SwissProt_v4',
-                'type': 'PSPD'
+                'type': 'PSPD',
+                'uniprot_id': result['uniprot_id'],
+                'pdb_id': '',
+                'accession_id': ''
             })
             
             valid_count += 1
@@ -517,11 +676,14 @@ def process_pspd_alphafold_structures(pspd_alphafold_dir, max_samples=None, num_
             samples.append({
                 'id': f'pspd_alphafold_{result["uniprot_id"]}_{valid_count:05d}',
                 'sequence': result['sequence'],
-                'text': '',  # Leave blank as requested
+                'answer': '',
                 'length': result['length'],
-                'question': '',  # Leave blank as requested
+                'question': '',
                 'subset': f'PSPD/AlphaFold/{proteome_name}',
-                'type': 'PSPD'
+                'type': 'PSPD',
+                'uniprot_id': result['uniprot_id'],
+                'pdb_id': '',
+                'accession_id': ''
             })
             
             valid_count += 1
@@ -615,11 +777,14 @@ def process_pspd_rcsb_structures(pspd_rcsb_dir, max_samples=None, num_workers=8)
             samples.append({
                 'id': f'pspd_rcsb_{result["pdb_id"]}_{valid_count:05d}',
                 'sequence': result['sequence'],
-                'text': '',  # Leave blank as requested
+                'answer': '',
                 'length': result['length'],
-                'question': '',  # Leave blank as requested
+                'question': '',
                 'subset': 'PSPD/RCSB_PDB',
-                'type': 'PSPD'
+                'type': 'PSPD',
+                'pdb_id': result['pdb_id'],
+                'uniprot_id': '',
+                'accession_id': ''
             })
             
             valid_count += 1
@@ -628,55 +793,101 @@ def process_pspd_rcsb_structures(pspd_rcsb_dir, max_samples=None, num_workers=8)
     return samples
 
 def deduplicate_by_sequence(samples):
-    """Deduplicate samples by sequence, combining texts"""
+    """Deduplicate samples by sequence, but only for pure sequence entries (no text/question).
+    Keep all QA pairs (samples with text or question) as separate entries."""
     print("\n" + "=" * 70)
     print("DEDUPLICATING BY SEQUENCE")
     print("=" * 70)
     
     print(f"Total samples before deduplication: {len(samples)}")
     
+    # Separate samples: pure sequences (to deduplicate) vs QA pairs (keep separate)
+    pure_sequences = []  # Empty text AND question
+    qa_pairs = []  # Has text OR question
+    
+    for sample in samples:
+        answer_empty = not sample.get('answer') or not sample['answer'].strip()
+        question_empty = not sample.get('question') or not sample['question'].strip()
+        
+        if answer_empty and question_empty:
+            pure_sequences.append(sample)
+        else:
+            qa_pairs.append(sample)
+    
+    print(f"  Pure sequence entries (to deduplicate): {len(pure_sequences)}")
+    print(f"  QA pairs (keep separate): {len(qa_pairs)}")
+    
+    # Deduplicate pure sequences by combining IDs, subsets, types
     seen_seqs = {}
     
-    for sample in tqdm(samples, desc="Deduplicating"):
+    for sample in tqdm(pure_sequences, desc="Deduplicating pure sequences"):
         # Truncate to first 2048 residues for deduplication
-        seq = sample['sequence'][:2048]  
+        seq = sample['sequence']
         
         if seq not in seen_seqs:
             seen_seqs[seq] = {
-                'id': sample['id'],
+                'id': [sample['id']],
                 'sequence': seq,
-                'text': [sample['text']],
+                'answer': '',
                 'length': sample['length'],
-                'question': sample['question'],
+                'question': '',
                 'subsets': {sample['subset']},
-                'types': {sample['type']}
+                'types': {sample['type']},
+                'pdb_ids': set(),
+                'uniprot_ids': set(),
+                'accession_ids': set()
             }
+            # Add IDs for the first occurrence
+            if sample.get('pdb_id'):
+                seen_seqs[seq]['pdb_ids'].add(sample['pdb_id'])
+            if sample.get('uniprot_id'):
+                seen_seqs[seq]['uniprot_ids'].add(sample['uniprot_id'])
+            if sample.get('accession_id'):
+                seen_seqs[seq]['accession_ids'].add(sample['accession_id'])
         else:
-            # Combine information
-            seen_seqs[seq]['text'].append(sample['text'])
+            # Combine information (including IDs) for duplicates
+            seen_seqs[seq]['id'].append(sample['id'])
             seen_seqs[seq]['subsets'].add(sample['subset'])
             seen_seqs[seq]['types'].add(sample['type'])
+            
+            # Combine IDs if available
+            if sample.get('pdb_id'):
+                seen_seqs[seq]['pdb_ids'].add(sample['pdb_id'])
+            if sample.get('uniprot_id'):
+                seen_seqs[seq]['uniprot_ids'].add(sample['uniprot_id'])
+            if sample.get('accession_id'):
+                seen_seqs[seq]['accession_ids'].add(sample['accession_id'])
     
-    # Reconstruct deduplicated samples
-    deduplicated = []
+    # Reconstruct deduplicated pure sequences
+    deduplicated_sequences = []
     for seq, data in seen_seqs.items():
-        # Combine texts with space
-        combined_text = ' '.join(data['text'])
+        # Combine IDs: convert sets to sorted lists, then to comma-separated strings (or '' if empty)
+        pdb_ids = sorted(data['pdb_ids']) if data['pdb_ids'] else []
+        uniprot_ids = sorted(data['uniprot_ids']) if data['uniprot_ids'] else []
+        accession_ids = sorted(data['accession_ids']) if data['accession_ids'] else []
         
-        deduplicated.append({
-            'id': data['id'],
+        deduplicated_sequences.append({
+            'id': ', '.join(sorted(data['id'])),
             'sequence': data['sequence'],
-            'text': combined_text,
+            'answer': data['answer'],
             'length': data['length'],
             'question': data['question'],
             'subset': ', '.join(sorted(data['subsets'])),
-            'type': ', '.join(sorted(data['types']))
+            'type': ', '.join(sorted(data['types'])),
+            'pdb_id': ', '.join(pdb_ids) if pdb_ids else '',
+            'uniprot_id': ', '.join(uniprot_ids) if uniprot_ids else '',
+            'accession_id': ', '.join(accession_ids) if accession_ids else ''
         })
     
-    print(f"Unique sequences: {len(deduplicated)}")
-    print(f"Duplicates removed: {len(samples) - len(deduplicated)}")
+    # Combine deduplicated sequences with QA pairs
+    all_samples = deduplicated_sequences + qa_pairs
     
-    return deduplicated
+    print(f"  Deduplicated sequences: {len(deduplicated_sequences)}")
+    print(f"  QA pairs kept: {len(qa_pairs)}")
+    print(f"  Total samples after deduplication: {len(all_samples)}")
+    print(f"  Duplicates removed: {len(pure_sequences) - len(deduplicated_sequences)}")
+    
+    return all_samples
 
 def main():
     print("=" * 70)
@@ -684,14 +895,15 @@ def main():
     print("=" * 70)
     
     # Get number of workers from environment or auto-detect optimal
-    num_workers = get_optimal_workers()
+    num_workers = 4
     cpu_count = os.cpu_count() or 'unknown'
-    print(f"Auto-detected optimal workers: {num_workers} (CPU count: {cpu_count})")
-    print(f"  (Set NUM_WORKERS environment variable to override)")    
+    print(f"(CPU count: {cpu_count})")
+    print(f"(Set NUM_WORKERS environment variable to override)")    
     print(f"Using {num_workers} workers for parallel processing")
     
     # Define data paths
     data_dir = Path(__file__).parent.parent / 'data' / 'datasets'
+    afdb_clustered_dir = data_dir / 'afdb_clustered'
     proteinlmbench_dir = data_dir / 'proteinlmbench'
     mol_instructions_dir = data_dir / 'mol_instructions_hf' / 'Protein-oriented_Instructions'
     alphafold_dir = data_dir / 'alphafold' / 'swissprot_v4'
@@ -705,51 +917,89 @@ def main():
     initial_stats_by_subset = {}  # Track stats before deduplication
     initial_stats_by_type = {}  # Track stats by subtype (PFUD, PSPD, PSAD, PDD)
     
-    # Process ProteinLMBench files (only the ones mentioned in README)
+    # Process AFDB Clustered structures
+    print("\n" + "=" * 70)
+    print("PROCESSING AFDB CLUSTERED STRUCTURES")
+    print("=" * 70)
+    
+    if afdb_clustered_dir.exists():
+        samples = process_afdb_clustered_structures(afdb_clustered_dir, max_samples=None, num_workers=num_workers)
+        # Track initial stats for this subset and type
+        if samples:
+            subset_name = samples[0]['subset']
+            dataset_type = samples[0]['type']
+            lengths = [s['length'] for s in samples]
+            sorted_lengths = sorted(lengths)
+            
+            # Track by subset
+            initial_stats_by_subset[subset_name] = {
+                'count': len(samples),
+                'sequence_length_stats': {
+                    'min': min(lengths),
+                    'max': max(lengths),
+                    'mean': round(sum(lengths)/len(lengths), 1),
+                    'median': sorted_lengths[len(lengths)//2]
+                }
+            }
+            
+            # Track by type (subtype)
+            if dataset_type not in initial_stats_by_type:
+                initial_stats_by_type[dataset_type] = {
+                    'count': 0,
+                    'lengths': []
+                }
+            initial_stats_by_type[dataset_type]['count'] += len(samples)
+            initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
+        all_samples.extend(samples)
+    else:
+        print(f"⚠️  AFDB Clustered directory not found: {afdb_clustered_dir}")
+    
+    # Process ProteinLMBench files (all subsets)
     print("\n" + "=" * 70)
     print("PROCESSING PROTEINLMBENCH")
     print("=" * 70)
     
-    # Only process these two subsets as mentioned in README
-    proteinlmbench_subsets = [
-        'UniProt_Function.json',  # 465K → PFUD
-        'UniProt_Subunit_structure.json'  # 291K → PSAD
-    ]
+    # Files to skip (metadata/summary files)
+    skip_files = {'download_summary.json', 'evaluation.json'}
     
     if proteinlmbench_dir.exists():
-        for subset_file in proteinlmbench_subsets:
-            json_file = proteinlmbench_dir / subset_file
-            if json_file.exists():
-                samples = process_proteinlmbench_file(json_file)
-                # Track initial stats for this subset and type
-                if samples:
-                    subset_name = samples[0]['subset']
-                    dataset_type = samples[0]['type']
-                    lengths = [s['length'] for s in samples]
-                    sorted_lengths = sorted(lengths)
-                    
-                    # Track by subset
-                    initial_stats_by_subset[subset_name] = {
-                        'count': len(samples),
-                        'sequence_length_stats': {
-                            'min': min(lengths),
-                            'max': max(lengths),
-                            'mean': round(sum(lengths)/len(lengths), 1),
-                            'median': sorted_lengths[len(lengths)//2]
-                        }
+        # Process all JSON files in the directory
+        json_files = sorted(proteinlmbench_dir.glob('*.json'))
+        
+        for json_file in json_files:
+            # Skip metadata/summary files
+            if json_file.name in skip_files:
+                print(f"⏭️  Skipping metadata file: {json_file.name}")
+                continue
+            
+            samples = process_proteinlmbench_file(json_file)
+            # Track initial stats for this subset and type
+            if samples:
+                subset_name = samples[0]['subset']
+                dataset_type = samples[0]['type']
+                lengths = [s['length'] for s in samples]
+                sorted_lengths = sorted(lengths)
+                
+                # Track by subset
+                initial_stats_by_subset[subset_name] = {
+                    'count': len(samples),
+                    'sequence_length_stats': {
+                        'min': min(lengths),
+                        'max': max(lengths),
+                        'mean': round(sum(lengths)/len(lengths), 1),
+                        'median': sorted_lengths[len(lengths)//2]
                     }
-                    
-                    # Track by type (subtype)
-                    if dataset_type not in initial_stats_by_type:
-                        initial_stats_by_type[dataset_type] = {
-                            'count': 0,
-                            'lengths': []
-                        }
-                    initial_stats_by_type[dataset_type]['count'] += len(samples)
-                    initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
-                all_samples.extend(samples)
-            else:
-                print(f"⚠️  File not found: {json_file}")
+                }
+                
+                # Track by type (subtype)
+                if dataset_type not in initial_stats_by_type:
+                    initial_stats_by_type[dataset_type] = {
+                        'count': 0,
+                        'lengths': []
+                    }
+                initial_stats_by_type[dataset_type]['count'] += len(samples)
+                initial_stats_by_type[dataset_type]['lengths'].extend(lengths)
+            all_samples.extend(samples)
     else:
         print(f"⚠️  ProteinLMBench directory not found: {proteinlmbench_dir}")
     
@@ -955,20 +1205,20 @@ def main():
     # Table 1: By Subset
     print("\n📊 Statistics by Subset:")
     print("-" * 70)
-    print(f"{'Subset':<50} {'Count':>15}")
+    print(f"{'Subset':<55} {'Count':>15}")
     print("-" * 70)
     subset_total = 0
     for subset_name, stats in sorted(initial_stats_by_subset.items()):
         count = stats['count']
         subset_total += count
-        print(f"{subset_name:<50} {count:>15,}")
+        print(f"{subset_name:<55} {count:>15,}")
     print("-" * 70)
-    print(f"{'TOTAL':<50} {subset_total:>15,}")
+    print(f"{'TOTAL':<55} {subset_total:>15,}")
     
     # Table 2: By Type (Subtype)
     print("\n📊 Statistics by Type (Subtype):")
     print("-" * 70)
-    print(f"{'Type':<50} {'Count':>15}")
+    print(f"{'Type':<55} {'Count':>15}")
     print("-" * 70)
     type_total = 0
     for dtype, stats in sorted(initial_stats_by_type_final.items()):
@@ -983,9 +1233,9 @@ def main():
         }
         desc = type_desc.get(dtype, '')
         type_label = f"{dtype} ({desc})" if desc else dtype
-        print(f"{type_label:<50} {count:>15,}")
+        print(f"{type_label:<55} {count:>15,}")
     print("-" * 70)
-    print(f"{'TOTAL':<50} {type_total:>15,}")
+    print(f"{'TOTAL':<55} {type_total:>15,}")
     
     # Deduplicate
     all_samples = deduplicate_by_sequence(all_samples)
@@ -1005,11 +1255,31 @@ def main():
     
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
+    # Restructure samples into QA and metadata sections
+    restructured_samples = []
+    for sample in all_samples:
+        restructured_samples.append({
+            'QA': {
+                'question': sample.get('question', ''),
+                'answer': sample.get('answer', ''),
+                'sequence': sample.get('sequence', '')
+            },
+            'metadata': {
+                'id': sample.get('id', ''),
+                'length': sample.get('length', 0),
+                'subset': sample.get('subset', ''),
+                'type': sample.get('type', ''),
+                'pdb_id': sample.get('pdb_id', ''),
+                'uniprot_id': sample.get('uniprot_id', ''),
+                'accession_id': sample.get('accession_id', '')
+            }
+        })
+    
     with open(output_file, 'w') as f:
-        json.dump(all_samples, f, indent=2)
+        json.dump(restructured_samples, f, indent=2)
     
     print(f"✅ Saved to: {output_file}")
-    print(f"   Total samples: {len(all_samples)}")
+    print(f"   Total samples: {len(restructured_samples)}")
     
     # Print statistics
     print("\n" + "=" * 70)
@@ -1020,10 +1290,10 @@ def main():
     subsets = Counter()
     types = Counter()
     
-    for sample in all_samples:
-        for subset in sample['subset'].split(', '):
+    for sample in restructured_samples:
+        for subset in sample['metadata']['subset'].split(', '):
             subsets[subset] += 1
-        for dtype in sample['type'].split(', '):
+        for dtype in sample['metadata']['type'].split(', '):
             types[dtype] += 1
     
     print("\nSamples by subset:")
@@ -1035,7 +1305,7 @@ def main():
         print(f"  {dtype}: {count}")
     
     # Length statistics
-    lengths = [s['length'] for s in all_samples]
+    lengths = [s['metadata']['length'] for s in restructured_samples]
     sorted_lengths = sorted(lengths)
     print(f"\nSequence length statistics:")
     print(f"  Min: {min(lengths)}")
@@ -1045,8 +1315,8 @@ def main():
     
     # Save statistics to metadata.json
     metadata = {
-        'total_samples': len(all_samples),
-        'unique_sequences': len(all_samples),
+        'total_samples': len(restructured_samples),
+        'unique_sequences': len(restructured_samples),
         'samples_by_subset': dict(subsets.most_common()),
         'samples_by_type': dict(types.most_common()),
         'sequence_length_stats': {
@@ -1070,15 +1340,15 @@ def main():
     print("SAMPLE ENTRIES")
     print("=" * 70)
     
-    for i, sample in enumerate(all_samples[:3]):
+    for i, sample in enumerate(restructured_samples[:3]):
         print(f"\nSample {i+1}:")
-        print(f"  ID: {sample['id']}")
-        print(f"  Type: {sample['type']}")
-        print(f"  Subset: {sample['subset']}")
-        print(f"  Sequence length: {sample['length']}")
-        print(f"  Sequence: {sample['sequence'][:50]}...")
-        print(f"  Question: {sample['question'][:80]}...")
-        print(f"  Text: {sample['text'][:100]}...")
+        print(f"  ID: {sample['metadata']['id']}")
+        print(f"  Type: {sample['metadata']['type']}")
+        print(f"  Subset: {sample['metadata']['subset']}")
+        print(f"  Sequence length: {sample['metadata']['length']}")
+        print(f"  Sequence: {sample['QA']['sequence'][:50]}...")
+        print(f"  Question: {sample['QA']['question'][:80]}...")
+        print(f"  Answer: {sample['QA']['answer'][:100]}...")
     
     print("\n" + "=" * 70)
     print("✅ STANDARDIZATION COMPLETE")
