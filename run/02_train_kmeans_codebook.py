@@ -297,7 +297,7 @@ def main():
         return
     
     # Check for existing model
-    kmeans_file = DATA_DIR / f'structure_codebook_K{N_CLUSTERS}.pkl'
+    kmeans_file = DATA_DIR / 'codebooks' / f'structure_codebook_K{N_CLUSTERS}.pkl'
     
     if kmeans_file.exists():
         print(f"\n🔄 Loading existing k-means model: {kmeans_file}")
@@ -352,7 +352,7 @@ def main():
     print(f"   Size: {kmeans_file.stat().st_size / 1024:.1f} KB")
     
     # Save summary
-    summary_file = DATA_DIR / f'codebook_summary_K{N_CLUSTERS}.json'
+    summary_file = DATA_DIR / 'codebooks' / f'codebook_summary_K{N_CLUSTERS}.json'
     
     with open(summary_file, 'w') as f:
         unique_labels, unique_counts = np.unique(labels, return_counts=True)

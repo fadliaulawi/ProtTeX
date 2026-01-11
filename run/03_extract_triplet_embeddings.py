@@ -219,7 +219,7 @@ def main():
     data_dir = Path('data')
     embeddings_dir = data_dir / 'esm_embeddings'
     # Use model-specific output directory
-    output_dir = data_dir / 'triplet_embeddings' / args.model
+    output_dir = data_dir / 'triplet_embeddings' / args.model / f'K{k_clusters}'
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"\n📌 Model: {args.model} ({model_config.model_name})")
@@ -237,8 +237,8 @@ def main():
     ESM_SEQ_MODEL_NAME = "facebook/esm2_t36_3B_UR50D"  # 3B model for sequence embeddings
     TEXT_MODEL_NAME = model_config.model_name
     
-    input_file = data_dir / 'standardized_protein_instructions.json'
-    codebook_path = data_dir / f'structure_codebook_K{k_clusters}.pkl'
+    input_file = data_dir / 'datasets' / 'standardized_protein_instructions.json'
+    codebook_path = data_dir / 'codebooks' / f'structure_codebook_K{k_clusters}.pkl'
     
     if not input_file.exists():
         print(f"❌ Input file not found: {input_file}")
@@ -374,12 +374,12 @@ def main():
                 continue
             
             protein = proteins[protein_idx]
-            sequence = protein['sequence']
-            text = protein['text']
-            protein_id = protein.get('id', f'protein_{protein_idx}')
+            sequence = protein['QA']['sequence']
+            answer = protein['QA']['answer']
+            question = protein['QA'].get('question', '')
             
-            # Skip if text is empty
-            if not text or not text.strip():
+            # Skip if answer is empty
+            if not answer or not answer.strip():
                 batch_skipped += 1
                 emb_offset += seq_length
                 continue
@@ -392,21 +392,36 @@ def main():
             seq_emb = extract_esm_embeddings(sequence, esm_model, esm_tokenizer, device)
             
             # Extract text embedding (mean-pooled)
-            text_emb = extract_text_embedding(text, text_model, text_tokenizer, device)
+            text_emb = extract_text_embedding(answer, text_model, text_tokenizer, device)
             
             # Extract structure tokens from pre-computed embeddings
             struct_tokens = extract_structure_tokens_from_embeddings(
                 sequence, protein_embeddings, kmeans, k_clusters
             )
             
-            # Create triplet
+            # Create triplet preserving QA and metadata structure
             triplet = {
-                "protein_id": protein_id,
-                "protein_index": protein_idx,
+                "QA": {
+                    "question": question,
+                    "answer": answer,
+                    "sequence": sequence
+                },
+                "metadata": {
+                    "id": protein['metadata'].get('id', f'protein_{protein_idx}'),
+                    "length": protein['metadata'].get('length', len(sequence)),
+                    "subset": protein['metadata'].get('subset', ''),
+                    "type": protein['metadata'].get('type', ''),
+                    "pdb_id": protein['metadata'].get('pdb_id', ''),
+                    "uniprot_id": protein['metadata'].get('uniprot_id', ''),
+                    "accession_id": protein['metadata'].get('accession_id', '')
+                },
+                "embeddings": {
+                    "sequence_embedding": seq_emb,
+                    "text_embedding": text_emb,
+                    "structure_tokens": struct_tokens
+                },
                 "batch_num": batch_num,
-                "sequence_embedding": seq_emb,
-                "text_embedding": text_emb,
-                "structure_tokens": struct_tokens
+                "protein_index": protein_idx
             }
             batch_triplets.append(triplet)
         
@@ -419,14 +434,14 @@ def main():
         
         # Save batch triplets
         if len(batch_triplets) > 0:
-            output_file = output_dir / f'triplet_embeddings_K{k_clusters}_batch_{batch_num}.npz'
+            output_file = output_dir / f'triplet_embeddings_batch_{batch_num}.npz'
             
-            # Stack numpy arrays
-            seq_embeddings = np.stack([t['sequence_embedding'] for t in batch_triplets])
-            text_embeddings = np.stack([t['text_embedding'] for t in batch_triplets])
-            protein_ids_array = np.array([t['protein_id'] for t in batch_triplets], dtype=object)
+            # Stack numpy arrays from embeddings section
+            seq_embeddings = np.stack([t['embeddings']['sequence_embedding'] for t in batch_triplets])
+            text_embeddings = np.stack([t['embeddings']['text_embedding'] for t in batch_triplets])
+            structure_tokens_array = np.stack([t['embeddings']['structure_tokens'] for t in batch_triplets])
+            protein_ids_array = np.array([t['metadata']['id'] for t in batch_triplets], dtype=object)
             protein_indices = np.array([t['protein_index'] for t in batch_triplets], dtype=np.int32)
-            structure_tokens_array = np.stack([t['structure_tokens'] for t in batch_triplets])
             
             np.savez_compressed(
                 output_file,
@@ -439,16 +454,20 @@ def main():
             
             print(f"   💾 Saved to: {output_file.name}")
         
-            # Save batch metadata with complete protein data for Q&A training
-            batch_meta_file = output_dir / f'triplet_metadata_K{k_clusters}_batch_{batch_num}.json'
+            # Save batch metadata preserving QA and metadata structure
+            batch_meta_file = output_dir / f'triplet_metadata_batch_{batch_num}.json'
             
-            # Build detailed metadata list for each protein
+            # Build metadata list preserving QA and metadata structure
             protein_metadata = []
             for triplet in batch_triplets:
-                protein_idx = triplet['protein_index']
-                protein = proteins[protein_idx]
-                metadata = generate_protein_metadata(protein, triplet['protein_id'])
-                protein_metadata.append(metadata)
+                # Preserve QA and metadata structure, add batch info
+                metadata_entry = {
+                    "QA": triplet['QA'],
+                    "metadata": triplet['metadata'],
+                    "batch_num": triplet['batch_num'],
+                    "protein_index": triplet['protein_index']
+                }
+                protein_metadata.append(metadata_entry)
             
             # Save as JSON (list of metadata dicts)
             with open(batch_meta_file, 'w') as f:

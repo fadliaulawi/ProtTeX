@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Tri-Modal Alignment Training - Sequence + Structure to Llama-3.1
-Aligns ESM-2 sequence embeddings and interleaved structure tokens with Llama-3.1 text embeddings.
+Tri-Modal Alignment Training - Sequence + Structure to Text
+Aligns ESM-2 sequence embeddings and interleaved structure tokens with text embeddings.
 Uses pre-extracted triplet embeddings from script 03.
 
-Based on tri-contrastive loss (A2 + B1):
-- Sequence ↔ Text
-- Structure ↔ Text  
-- Sequence ↔ Structure (consistency term)
+Type-aware tri-contrastive loss:
+- PFUD/PSAD types: Sequence ↔ Text, Structure ↔ Text, Sequence ↔ Structure + consistency
+- PDD/PSPD types: Sequence ↔ Structure only (no text, as answer==sequence for PDD)
 """
 
 import json
@@ -50,6 +49,7 @@ class TripletEmbeddingDataset(Dataset):
                 - sequence_embedding: ESM-2 3B embedding (2560-dim)
                 - structure_tokens: Interleaved tokens [BOS, AA, Struct, AA, Struct, ..., EOS]
                 - text_embedding: Model-specific text embedding (varies by model)
+                - protein_type: Type of protein (PFUD, PSAD, PDD, PSPD)
         """
         self.triplets = triplets
     
@@ -63,13 +63,14 @@ class TripletEmbeddingDataset(Dataset):
             'sequence_emb': torch.tensor(triplet['sequence_embedding'], dtype=torch.float32),
             'structure_tokens': torch.tensor(triplet['structure_tokens'], dtype=torch.long),
             'text_emb': torch.tensor(triplet['text_embedding'], dtype=torch.float32),
-            'protein_id': triplet.get('protein_id', f'p_{idx}')
+            'protein_id': triplet.get('protein_id', f'p_{idx}'),
+            'protein_type': triplet.get('protein_type', 'PFUD')  # Default to PFUD
         }
 
 
-def load_batch_file(batch_file: Path) -> list:
+def load_batch_file(batch_file: Path, metadata_file: Path = None) -> list:
     """
-    Load a single batch file (NPZ compressed format from script 03).
+    Load a single batch file (NPZ compressed format from script 03) with metadata.
     
     NPZ file structure:
     - sequence_embeddings: [n, 2560] (float32) - ESM-2 3B embeddings
@@ -80,9 +81,10 @@ def load_batch_file(batch_file: Path) -> list:
     
     Args:
         batch_file: Path to triplet_embeddings_K{k}_batch_*.npz
+        metadata_file: Path to triplet_metadata_batch_*.json (optional)
     
     Returns:
-        triplets: List of dicts with numpy arrays
+        triplets: List of dicts with numpy arrays and type information
     """
     # Load NPZ file
     data = np.load(batch_file, allow_pickle=True)
@@ -93,26 +95,45 @@ def load_batch_file(batch_file: Path) -> list:
     structure_tokens = data['structure_tokens']       # [n, max_len] int16
     protein_ids = data['protein_ids']                 # [n] object (strings)
     
+    # Load metadata if available
+    metadata_dict = {}
+    if metadata_file and metadata_file.exists():
+        try:
+            with open(metadata_file, 'r') as f:
+                metadata_list = json.load(f)
+            # Create mapping from protein_id to type
+            for meta_entry in metadata_list:
+                protein_id = meta_entry.get('metadata', {}).get('id', '')
+                protein_type = meta_entry.get('metadata', {}).get('type', 'PFUD')
+                metadata_dict[protein_id] = protein_type
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load metadata from {metadata_file}: {e}")
+    
     # Reconstruct triplets
     triplets = []
     for i in range(len(seq_embeddings)):
+        protein_id = str(protein_ids[i])
+        protein_type = metadata_dict.get(protein_id, 'PFUD')  # Default to PFUD if not found
+        
         triplet = {
             'sequence_embedding': seq_embeddings[i],       # numpy [2560] float32
             'text_embedding': text_embeddings[i],          # numpy [text_dim] float32
             'structure_tokens': structure_tokens[i],       # numpy [max_len] int16
-            'protein_id': str(protein_ids[i])
+            'protein_id': protein_id,
+            'protein_type': protein_type
         }
         triplets.append(triplet)
     
     return triplets
 
 
-def load_all_batch_files(batch_files: list) -> Tuple[list, list]:
+def load_all_batch_files(batch_files: list, metadata_dir: Path = None) -> Tuple[list, list]:
     """
     Load all batch files and combine into single train/val split.
     
     Args:
         batch_files: List of paths to triplet_embeddings_K{k}_batch_*.npz files
+        metadata_dir: Directory containing triplet_metadata_batch_*.json files
     
     Returns:
         (train_triplets, val_triplets): Combined lists of all triplets
@@ -122,13 +143,28 @@ def load_all_batch_files(batch_files: list) -> Tuple[list, list]:
     
     for batch_file in tqdm(batch_files, desc="Loading files"):
         try:
-            triplets = load_batch_file(batch_file)
+            # Try to find corresponding metadata file
+            metadata_file = None
+            if metadata_dir:
+                # Extract batch number from filename (e.g., triplet_embeddings_batch_36.npz -> batch_36)
+                if 'batch_' in batch_file.stem:
+                    batch_part = batch_file.stem.split('batch_')[-1]  # Get '36' part
+                    metadata_file = metadata_dir / f'triplet_metadata_batch_{batch_part}.json'
+            
+            triplets = load_batch_file(batch_file, metadata_file)
             all_triplets.extend(triplets)
         except Exception as e:
             print(f"⚠️  Error loading {batch_file.name}: {e}")
             continue
     
     print(f"✅ Loaded {len(all_triplets):,} total samples")
+    
+    # Count types
+    type_counts = {}
+    for triplet in all_triplets:
+        ptype = triplet.get('protein_type', 'PFUD')
+        type_counts[ptype] = type_counts.get(ptype, 0) + 1
+    print(f"   Type distribution: {type_counts}")
     
     # Shuffle all triplets
     print("🔀 Shuffling dataset...")
@@ -247,17 +283,20 @@ class TriModalAlignmentModel(nn.Module):
         
         return seq_proj, struct_proj, text_proj
 
-def clip_contrastive_loss(seq_proj, struct_proj, text_proj, temperature=0.07, alpha=1.0, beta=1.0, lambda_cons=0.1):
+def clip_contrastive_loss(seq_proj, struct_proj, text_proj, protein_types, temperature=0.07, 
+                          alpha=1.0, beta=1.0, gamma=1.0, lambda_cons=0.1):
     """
-    Tri-contrastive loss.
+    Tri-contrastive loss with type-aware handling.
     
     Args:
         seq_proj: [batch, shared_dim] (sequence projected)
         struct_proj: [batch, shared_dim] (structure projected)
         text_proj: [batch, shared_dim] (text projected)
+        protein_types: [batch] (list of protein types: PFUD, PSAD, PDD, PSPD)
         temperature: Temperature for scaling
-        alpha: Weight for seq-text loss
-        beta: Weight for struct-text loss
+        alpha: Weight for seq-text loss (for PFUD/PSAD only)
+        beta: Weight for struct-text loss (for PFUD/PSAD only)
+        gamma: Weight for seq-struct loss
         lambda_cons: Weight for consistency term
     
     Returns:
@@ -265,40 +304,93 @@ def clip_contrastive_loss(seq_proj, struct_proj, text_proj, temperature=0.07, al
         loss_dict: dict with individual losses
     """
     batch_size = seq_proj.shape[0]
-    labels = torch.arange(batch_size, device=seq_proj.device)
+    device = seq_proj.device
+    labels = torch.arange(batch_size, device=device)
     
-    # === Pairwise InfoNCE Loss (seq-text) ===
-    logits_seq_text = torch.mm(seq_proj, text_proj.t()) / temperature
-    loss_seq_text = F.cross_entropy(logits_seq_text, labels)
-    loss_text_seq = F.cross_entropy(logits_seq_text.t(), labels)
-    loss_seq_text_total = (loss_seq_text + loss_text_seq) / 2
+    # Create masks for different types
+    # PFUD and PSAD: use text embeddings (seq-text, struct-text)
+    # PDD and PSPD: only use seq-struct (no text)
+    use_text_mask = torch.tensor([
+        t in ['PFUD', 'PSAD'] for t in protein_types
+    ], dtype=torch.bool, device=device)
     
-    # === Pairwise InfoNCE Loss (struct-text) ===
-    logits_struct_text = torch.mm(struct_proj, text_proj.t()) / temperature
-    loss_struct_text = F.cross_entropy(logits_struct_text, labels)
-    loss_text_struct = F.cross_entropy(logits_struct_text.t(), labels)
-    loss_struct_text_total = (loss_struct_text + loss_text_struct) / 2
+    # Initialize losses
+    loss_seq_text_total = torch.tensor(0.0, device=device)
+    loss_struct_text_total = torch.tensor(0.0, device=device)
+    loss_seq_struct_total = torch.tensor(0.0, device=device)
+    consistency_loss = torch.tensor(0.0, device=device)
     
-    # === Consistency Term (seq-struct-text) ===
-    consistency_loss = (
-        torch.norm(seq_proj - struct_proj, p=2, dim=1).pow(2).mean() +
-        torch.norm(seq_proj - text_proj, p=2, dim=1).pow(2).mean() +
-        torch.norm(struct_proj - text_proj, p=2, dim=1).pow(2).mean()
+    n_text_samples = use_text_mask.sum().item()
+    
+    # === Pairwise InfoNCE Loss (seq-struct) - applies to ALL samples ===
+    logits_seq_struct = torch.mm(seq_proj, struct_proj.t()) / temperature
+    loss_seq_struct = F.cross_entropy(logits_seq_struct, labels)
+    loss_struct_seq = F.cross_entropy(logits_seq_struct.t(), labels)
+    loss_seq_struct_total = (loss_seq_struct + loss_struct_seq) / 2
+    
+    # === Pairwise InfoNCE Loss (seq-text) and (struct-text) - only for PFUD/PSAD ===
+    if n_text_samples > 1:  # Need at least 2 samples for contrastive loss
+        # Filter to samples that use text
+        seq_proj_text = seq_proj[use_text_mask]
+        struct_proj_text = struct_proj[use_text_mask]
+        text_proj_text = text_proj[use_text_mask]
+        labels_text = torch.arange(n_text_samples, device=device)
+        
+        # Seq-text InfoNCE loss
+        logits_seq_text = torch.mm(seq_proj_text, text_proj_text.t()) / temperature
+        loss_seq_text = F.cross_entropy(logits_seq_text, labels_text)
+        loss_text_seq = F.cross_entropy(logits_seq_text.t(), labels_text)
+        loss_seq_text_total = (loss_seq_text + loss_text_seq) / 2
+        
+        # Struct-text InfoNCE loss
+        logits_struct_text = torch.mm(struct_proj_text, text_proj_text.t()) / temperature
+        loss_struct_text = F.cross_entropy(logits_struct_text, labels_text)
+        loss_text_struct = F.cross_entropy(logits_struct_text.t(), labels_text)
+        loss_struct_text_total = (loss_struct_text + loss_text_struct) / 2
+        
+        # Consistency Term (for PFUD/PSAD with text)
+        consistency_loss = (
+            torch.norm(seq_proj_text - struct_proj_text, p=2, dim=1).pow(2).mean() +
+            torch.norm(seq_proj_text - text_proj_text, p=2, dim=1).pow(2).mean() +
+            torch.norm(struct_proj_text - text_proj_text, p=2, dim=1).pow(2).mean()
+        )
+    elif n_text_samples == 1:
+        # Single text sample: can still compute consistency but not contrastive loss
+        seq_proj_text = seq_proj[use_text_mask]
+        struct_proj_text = struct_proj[use_text_mask]
+        text_proj_text = text_proj[use_text_mask]
+        consistency_loss = (
+            torch.norm(seq_proj_text - struct_proj_text, p=2, dim=1).pow(2).mean() +
+            torch.norm(seq_proj_text - text_proj_text, p=2, dim=1).pow(2).mean() +
+            torch.norm(struct_proj_text - text_proj_text, p=2, dim=1).pow(2).mean()
+        )
+    else:
+        # For seq-struct only batches (PDD/PSPD), use a simpler consistency term
+        consistency_loss = torch.norm(seq_proj - struct_proj, p=2, dim=1).pow(2).mean()
+    
+    # Total loss - scale text losses by the fraction of samples that use them
+    text_weight = n_text_samples / batch_size if batch_size > 0 else 0.0
+    
+    total_loss = (
+        gamma * loss_seq_struct_total +  # Always apply seq-struct loss
+        alpha * loss_seq_text_total * text_weight +  # Only for PFUD/PSAD
+        beta * loss_struct_text_total * text_weight +  # Only for PFUD/PSAD
+        lambda_cons * consistency_loss * text_weight  # Only for PFUD/PSAD
     )
     
-    # Total loss
-    total_loss = alpha * loss_seq_text_total + beta * loss_struct_text_total + lambda_cons * consistency_loss
-    
     return total_loss, {
-        'seq_text': loss_seq_text_total.item(),
-        'struct_text': loss_struct_text_total.item(),
-        'consistency': consistency_loss.item()
+        'seq_text': loss_seq_text_total.item() if isinstance(loss_seq_text_total, torch.Tensor) else 0.0,
+        'struct_text': loss_struct_text_total.item() if isinstance(loss_struct_text_total, torch.Tensor) else 0.0,
+        'seq_struct': loss_seq_struct_total.item(),
+        'consistency': consistency_loss.item() if isinstance(consistency_loss, torch.Tensor) else 0.0,
+        'n_text_samples': n_text_samples,
+        'n_total_samples': batch_size
     }
 
 class Trainer:
     """Training loop"""
     
-    def __init__(self, model, device="cuda", lr=1e-4, alpha=1.0, beta=1.0, lambda_cons=0.1, 
+    def __init__(self, model, device="cuda", lr=1e-4, alpha=1.0, beta=1.0, gamma=1.0, lambda_cons=0.1, 
                  patience=5, min_delta=1e-4):
         """
         Args:
@@ -309,6 +401,7 @@ class Trainer:
         self.device = device
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
         self.lambda_cons = lambda_cons
         
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -330,22 +423,22 @@ class Trainer:
         """Train one epoch"""
         self.model.train()
         total_loss = 0
-        batch_losses = []
         
         pbar = tqdm(loader, desc="Training")
         for batch in pbar:
             sequence_emb = batch['sequence_emb'].to(self.device)
             structure_tokens = batch['structure_tokens'].to(self.device)
             text_emb = batch['text_emb'].to(self.device)
+            protein_types = batch['protein_type']  # List of strings
             
             # Forward
             seq_proj, struct_proj, text_proj = self.model(sequence_emb, structure_tokens, text_emb)
             
-            # Loss (tri-contrastive)
+            # Loss (type-aware tri-contrastive)
             loss, loss_dict = clip_contrastive_loss(
-                seq_proj, struct_proj, text_proj,
+                seq_proj, struct_proj, text_proj, protein_types,
                 temperature=self.model.temperature,
-                alpha=self.alpha, beta=self.beta, lambda_cons=self.lambda_cons
+                alpha=self.alpha, beta=self.beta, gamma=self.gamma, lambda_cons=self.lambda_cons
             )
             
             # Backward
@@ -355,7 +448,6 @@ class Trainer:
             self.optimizer.step()
             
             total_loss += loss.item()
-            batch_losses.append(loss.item())
             self.step += 1
             
             # Log to wandb (every batch)
@@ -363,7 +455,10 @@ class Trainer:
                 'train/batch_loss': loss.item(),
                 'train/seq_text_loss': loss_dict['seq_text'],
                 'train/struct_text_loss': loss_dict['struct_text'],
+                'train/seq_struct_loss': loss_dict['seq_struct'],
                 'train/consistency_loss': loss_dict['consistency'],
+                'train/n_text_samples': loss_dict['n_text_samples'],
+                'train/n_total_samples': loss_dict['n_total_samples'],
                 'train/step': self.step,
             })
             
@@ -379,23 +474,22 @@ class Trainer:
         """Validate"""
         self.model.eval()
         total_loss = 0
-        batch_losses = []
         
         pbar = tqdm(loader, desc="Validation")
         for batch in pbar:
             sequence_emb = batch['sequence_emb'].to(self.device)
             structure_tokens = batch['structure_tokens'].to(self.device)
             text_emb = batch['text_emb'].to(self.device)
+            protein_types = batch['protein_type']  # List of strings
             
             seq_proj, struct_proj, text_proj = self.model(sequence_emb, structure_tokens, text_emb)
             loss, loss_dict = clip_contrastive_loss(
-                seq_proj, struct_proj, text_proj,
+                seq_proj, struct_proj, text_proj, protein_types,
                 temperature=self.model.temperature,
-                alpha=self.alpha, beta=self.beta, lambda_cons=self.lambda_cons
+                alpha=self.alpha, beta=self.beta, gamma=self.gamma, lambda_cons=self.lambda_cons
             )
             
             total_loss += loss.item()
-            batch_losses.append(loss.item())
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         avg_loss = total_loss / len(loader)
@@ -451,8 +545,8 @@ def main():
     parser.add_argument('--model', type=str, required=True,
                        choices=list_available_models(),
                        help=f'Model type: {", ".join(list_available_models())}')
-    parser.add_argument('--k', type=int, default=128,
-                       help='Number of k-means clusters for structure tokens (default: 128)')
+    parser.add_argument('--k', type=int, required=True,
+                       help='Number of k-means clusters for structure tokens')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--batch-size', type=int, default=2048,
@@ -467,8 +561,9 @@ def main():
     
     # Fixed hyperparameters
     learning_rate = 1e-4
-    alpha = 1.0
-    beta = 1.0
+    alpha = 1.0  # Weight for seq-text loss (PFUD/PSAD only)
+    beta = 1.0   # Weight for struct-text loss (PFUD/PSAD only)
+    gamma = 1.0  # Weight for seq-struct loss (all types)
     lambda_cons = 0.1
     patience = 5
     
@@ -482,7 +577,7 @@ def main():
     
     # Initialize wandb
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    wandb_run_name = f"run-tri-{args.model}-{timestamp}"
+    wandb_run_name = f"run-tri-{args.model}-K{k_clusters}-{timestamp}"
     
     wandb.init(
         project='prottex-clip-alignment',
@@ -494,6 +589,7 @@ def main():
             'learning_rate': learning_rate,
             'alpha': alpha,
             'beta': beta,
+            'gamma': gamma,
             'lambda_cons': lambda_cons,
             'patience': patience,
             'sequence_dim': ESM_HIDDEN_DIM,
@@ -517,13 +613,14 @@ def main():
     print(f"📌 Epochs: {args.epochs}")
     print(f"📌 Batch size: {args.batch_size}")
     print(f"📌 Learning rate: {learning_rate}")
-    print(f"📌 Loss weights: α={alpha}, β={beta}, λ={lambda_cons}")
+    print(f"📌 Loss weights: α={alpha} (seq-text), β={beta} (struct-text), γ={gamma} (seq-struct), λ={lambda_cons} (consistency)")
     print(f"📌 Early stopping patience: {patience} epochs")
     
     # Setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use model-specific triplet directory
-    data_dir = Path(f'data/triplet_embeddings/{args.model}')
+    # Use model-specific triplet directory with K{k_clusters} subdirectory
+    data_dir = Path(f'data/triplet_embeddings/{args.model}/K{k_clusters}')
+    metadata_dir = data_dir
     # Use model-specific output directory
     output_dir = Path(f'data/clip_alignment/{args.model}_K{k_clusters}')
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -538,7 +635,7 @@ def main():
     print("=" * 70)
     
     try:
-        batch_files = sorted(data_dir.glob(f"triplet_embeddings_K{k_clusters}_batch_*.npz"))
+        batch_files = sorted(data_dir.glob(f"triplet_embeddings_batch_*.npz"))
         
         if not batch_files:
             print(f"❌ No NPZ batch files found in {data_dir} for K={k_clusters}")
@@ -547,6 +644,13 @@ def main():
         
         print(f"✅ Found {len(batch_files)} batch files (NPZ format)")
         print(f"   Will process: {batch_files[0].name} → {batch_files[-1].name}")
+        
+        # Check for metadata files
+        metadata_files = sorted(data_dir.glob(f"triplet_metadata_batch_*.json"))
+        if metadata_files:
+            print(f"✅ Found {len(metadata_files)} metadata files")
+        else:
+            print(f"⚠️  No metadata files found - types will default to PFUD")
     except Exception as e:
         print(f"❌ Error finding batch files: {e}")
         return
@@ -582,7 +686,7 @@ def main():
     
     trainer = Trainer(
         model, device=device, lr=learning_rate,
-        alpha=alpha, beta=beta, lambda_cons=lambda_cons,
+        alpha=alpha, beta=beta, gamma=gamma, lambda_cons=lambda_cons,
         patience=patience
     )
     
@@ -590,7 +694,9 @@ def main():
     print(f"   Global epochs: {args.epochs}")
     print(f"   Batch files: {len(batch_files)}")
     print(f"   Batch size: {args.batch_size}")
-    print(f"   Loss: Tri-Contrastive (CLIP-style)\n")
+    print(f"   Loss: Type-aware Tri-Contrastive (CLIP-style)")
+    print(f"      - PFUD/PSAD: seq-text + struct-text + seq-struct + consistency")
+    print(f"      - PDD/PSPD: seq-struct only\n")
     
     # Global epoch loop
     for global_epoch in range(args.epochs):
@@ -599,7 +705,7 @@ def main():
         print(f"{'='*70}")
         
         # Load all batch files at the start of each epoch
-        train_triplets, val_triplets = load_all_batch_files(batch_files)
+        train_triplets, val_triplets = load_all_batch_files(batch_files, metadata_dir)
         
         # Create datasets and loaders
         train_dataset = TripletEmbeddingDataset(train_triplets)
@@ -659,7 +765,7 @@ def main():
         'batch_size': args.batch_size,
         'epochs': args.epochs,
         'learning_rate': learning_rate,
-        'loss_weights': {'alpha': alpha, 'beta': beta, 'lambda': lambda_cons},
+        'loss_weights': {'alpha': alpha, 'beta': beta, 'gamma': gamma, 'lambda': lambda_cons},
         'timestamp': datetime.now().isoformat()
     }
     

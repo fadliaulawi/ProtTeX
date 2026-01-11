@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Parallel Triplet Extraction Script
-# Distributes 72 batches across 8 GPUs (9 batches per GPU)
-# Requires --model argument (llama, qwen, qwen2.7, deepseek-v2, deepseek-r1, deepseek-r1-distill)
+# Automatically detects available ESM embedding batch files and distributes them across 8 GPUs
+# Requires --model argument (llama, qwen, deepseek) and --k argument
 
 # Parse arguments
 MODEL=""
@@ -23,12 +23,12 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Usage: $0 --model <model_type> --k <K>"
             echo ""
-            echo "Available models: llama, qwen, qwen2.7, deepseek-v2, deepseek-r1, deepseek-r1-distill"
+            echo "Available models: llama, qwen, deepseek"
             echo ""
             echo "Examples:"
             echo "  $0 --model llama --k 128"
             echo "  $0 --model qwen --k 128"
-            echo "  $0 --model deepseek-v2 --k 128"
+            echo "  $0 --model deepseek --k 128"
             exit 1
             ;;
     esac
@@ -40,7 +40,7 @@ if [ -z "$MODEL" ]; then
     echo ""
     echo "Usage: $0 --model <model_type> --k <K>"
     echo ""
-    echo "Available models: llama, qwen, qwen2.7, deepseek-v2, deepseek-r1, deepseek-r1-distill"
+    echo "Available models: llama, qwen, deepseek"
     echo ""
     echo "Examples:"
     echo "  $0 --model llama --k 128"
@@ -57,98 +57,143 @@ if [ -z "$K" ]; then
     exit 1
 fi
 
+# Get script directory and determine data directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$SCRIPT_DIR/../data"
+EMBEDDINGS_DIR="$DATA_DIR/esm_embeddings"
+
+# Check if embeddings directory exists
+if [ ! -d "$EMBEDDINGS_DIR" ]; then
+    echo "❌ Error: Embeddings directory not found: $EMBEDDINGS_DIR"
+    echo "   Run 01_extract_esm_embeddings.py first!"
+    exit 1
+fi
+
+# Find all ESM embedding batch files and extract batch numbers
+BATCH_FILES=($(find "$EMBEDDINGS_DIR" -name "esm_embeddings_batch_*.npy" | sort -V))
+
+if [ ${#BATCH_FILES[@]} -eq 0 ]; then
+    echo "❌ Error: No ESM embedding batch files found in $EMBEDDINGS_DIR"
+    echo "   Run 01_extract_esm_embeddings.py first!"
+    exit 1
+fi
+
+# Extract batch numbers from filenames
+BATCH_NUMS=()
+for file in "${BATCH_FILES[@]}"; do
+    # Extract batch number from filename: esm_embeddings_batch_123.npy -> 123
+    batch_num=$(basename "$file" | sed -n 's/esm_embeddings_batch_\([0-9]*\)\.npy/\1/p')
+    if [[ "$batch_num" =~ ^[0-9]+$ ]]; then
+        BATCH_NUMS+=($batch_num)
+    fi
+done
+
+# Sort batch numbers numerically
+IFS=$'\n' BATCH_NUMS=($(sort -n <<<"${BATCH_NUMS[*]}"))
+unset IFS
+
+NUM_BATCHES=${#BATCH_NUMS[@]}
+MIN_BATCH=${BATCH_NUMS[0]}
+MAX_BATCH=${BATCH_NUMS[-1]}
+NUM_GPUS=8
+
+# Calculate total batch range (assuming consecutive batches from min to max)
+# If batches are not consecutive, we'll still distribute the range evenly
+TOTAL_BATCH_RANGE=$((MAX_BATCH - MIN_BATCH + 1))
+BATCHES_PER_GPU=$(( TOTAL_BATCH_RANGE / NUM_GPUS ))
+REMAINDER=$(( TOTAL_BATCH_RANGE % NUM_GPUS ))
+
 echo "=============================================="
 echo "PARALLEL TRIPLET EXTRACTION - Model: $MODEL, K=$K"
 echo "=============================================="
-echo "Distributing 72 batches across 8 GPUs"
+echo "Embeddings directory: $EMBEDDINGS_DIR"
+echo "Found $NUM_BATCHES batch files (batch $MIN_BATCH to $MAX_BATCH)"
+echo "Total batch range: $TOTAL_BATCH_RANGE (from $MIN_BATCH to $MAX_BATCH)"
+echo "Number of GPUs: $NUM_GPUS"
+echo "Batches per GPU: ~$BATCHES_PER_GPU"
+if [ $REMAINDER -gt 0 ]; then
+    echo "Extra batches: $REMAINDER (will be distributed to first $REMAINDER GPUs)"
+fi
 echo ""
 
 # Create logs directory
-mkdir -p logs
+mkdir -p logs/triplet
 
-# GPU 0: batches 0-8
-echo "Starting GPU 0 (batches 0-8)..."
-CUDA_VISIBLE_DEVICES=0 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 0 --batch-end 9 > logs/triplet_${MODEL}_gpu0_K${K}.log 2>&1 &
-PID0=$!
+# Distribute batches across GPUs
+CURRENT_BATCH=$MIN_BATCH
+GPU_PIDS=()
+GPU_INFO=()
 
-# GPU 1: batches 9-17
-echo "Starting GPU 1 (batches 9-17)..."
-CUDA_VISIBLE_DEVICES=1 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 9 --batch-end 18 > logs/triplet_${MODEL}_gpu1_K${K}.log 2>&1 &
-PID1=$!
-
-# GPU 2: batches 18-26
-echo "Starting GPU 2 (batches 18-26)..."
-CUDA_VISIBLE_DEVICES=2 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 18 --batch-end 27 > logs/triplet_${MODEL}_gpu2_K${K}.log 2>&1 &
-PID2=$!
-
-# GPU 3: batches 27-35
-echo "Starting GPU 3 (batches 27-35)..."
-CUDA_VISIBLE_DEVICES=3 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 27 --batch-end 36 > logs/triplet_${MODEL}_gpu3_K${K}.log 2>&1 &
-PID3=$!
-
-# GPU 4: batches 36-44
-echo "Starting GPU 4 (batches 36-44)..."
-CUDA_VISIBLE_DEVICES=4 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 36 --batch-end 45 > logs/triplet_${MODEL}_gpu4_K${K}.log 2>&1 &
-PID4=$!
-
-# GPU 5: batches 45-53
-echo "Starting GPU 5 (batches 45-53)..."
-CUDA_VISIBLE_DEVICES=5 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 45 --batch-end 54 > logs/triplet_${MODEL}_gpu5_K${K}.log 2>&1 &
-PID5=$!
-
-# GPU 6: batches 54-62
-echo "Starting GPU 6 (batches 54-62)..."
-CUDA_VISIBLE_DEVICES=6 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 54 --batch-end 63 > logs/triplet_${MODEL}_gpu6_K${K}.log 2>&1 &
-PID6=$!
-
-# GPU 7: batches 63-71
-echo "Starting GPU 7 (batches 63-71)..."
-CUDA_VISIBLE_DEVICES=7 python -u run/03_extract_triplet_embeddings.py --model $MODEL --k $K --batch-start 63 --batch-end 72 > logs/triplet_${MODEL}_gpu7_K${K}.log 2>&1 &
-PID7=$!
+for gpu in $(seq 0 $((NUM_GPUS - 1))); do
+    # Calculate batches for this GPU
+    if [ $gpu -lt $REMAINDER ]; then
+        # First REMAINDER GPUs get one extra batch
+        GPU_BATCHES=$((BATCHES_PER_GPU + 1))
+    else
+        GPU_BATCHES=$BATCHES_PER_GPU
+    fi
+    
+    START_BATCH=$CURRENT_BATCH
+    END_BATCH=$((CURRENT_BATCH + GPU_BATCHES))
+    
+    # Don't exceed max batch (end_batch is exclusive in Python, so we use MAX_BATCH + 1)
+    if [ $END_BATCH -gt $((MAX_BATCH + 1)) ]; then
+        END_BATCH=$((MAX_BATCH + 1))
+    fi
+    
+    if [ $START_BATCH -le $MAX_BATCH ]; then
+        # Launch GPU process and capture PID
+        echo "Starting GPU $gpu (batches $START_BATCH-$((END_BATCH - 1)))..."
+        CUDA_VISIBLE_DEVICES=$gpu python -u run/03_extract_triplet_embeddings.py \
+            --model $MODEL --k $K \
+            --batch-start $START_BATCH --batch-end $END_BATCH \
+            > logs/triplet/${MODEL}_gpu${gpu}_K${K}.log 2>&1 &
+        PID=$!
+        GPU_PIDS+=($PID)
+        GPU_INFO+=("$gpu:$START_BATCH:$((END_BATCH - 1))")
+        CURRENT_BATCH=$END_BATCH
+        
+        # Break if we've assigned all batches
+        if [ $CURRENT_BATCH -gt $MAX_BATCH ]; then
+            break
+        fi
+    fi
+done
 
 echo ""
-echo "All 8 processes started!"
-echo "  GPU 0 (PID $PID0): batches 0-8    -> logs/triplet_${MODEL}_gpu0_K${K}.log"
-echo "  GPU 1 (PID $PID1): batches 9-17   -> logs/triplet_${MODEL}_gpu1_K${K}.log"
-echo "  GPU 2 (PID $PID2): batches 18-26  -> logs/triplet_${MODEL}_gpu2_K${K}.log"
-echo "  GPU 3 (PID $PID3): batches 27-35  -> logs/triplet_${MODEL}_gpu3_K${K}.log"
-echo "  GPU 4 (PID $PID4): batches 36-44  -> logs/triplet_${MODEL}_gpu4_K${K}.log"
-echo "  GPU 5 (PID $PID5): batches 45-53  -> logs/triplet_${MODEL}_gpu5_K${K}.log"
-echo "  GPU 6 (PID $PID6): batches 54-62  -> logs/triplet_${MODEL}_gpu6_K${K}.log"
-echo "  GPU 7 (PID $PID7): batches 63-71  -> logs/triplet_${MODEL}_gpu7_K${K}.log"
+echo "All ${#GPU_PIDS[@]} processes started!"
+for i in "${!GPU_PIDS[@]}"; do
+    OLD_IFS=$IFS
+    IFS=':' read -r gpu_id start_b end_b <<< "${GPU_INFO[$i]}"
+    IFS=$OLD_IFS
+    echo "  GPU $gpu_id (PID ${GPU_PIDS[$i]}): batches $start_b-$end_b -> logs/triplet/${MODEL}_gpu${gpu_id}_K${K}.log"
+done
 echo ""
 echo "Monitor progress:"
-echo "  tail -f logs/triplet_${MODEL}_gpu0_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu1_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu2_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu3_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu4_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu5_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu6_K${K}.log"
-echo "  tail -f logs/triplet_${MODEL}_gpu7_K${K}.log"
+for i in "${!GPU_PIDS[@]}"; do
+    OLD_IFS=$IFS
+    IFS=':' read -r gpu_id start_b end_b <<< "${GPU_INFO[$i]}"
+    IFS=$OLD_IFS
+    echo "  tail -f logs/triplet/${MODEL}_gpu${gpu_id}_K${K}.log"
+done
 echo ""
 echo "Waiting for all processes to complete..."
 
 # Wait for all background processes
-wait $PID0
-wait $PID1
-wait $PID2
-wait $PID3
-wait $PID4
-wait $PID5
-wait $PID6
-wait $PID7
+for pid in "${GPU_PIDS[@]}"; do
+    wait $pid
+done
 
 echo ""
 echo "=============================================="
 echo "✅ ALL TRIPLET EXTRACTION COMPLETE!"
 echo "=============================================="
+echo "Processed $NUM_BATCHES batches (batch $MIN_BATCH to $MAX_BATCH)"
+echo ""
 echo "Check logs for details:"
-echo "  logs/triplet_${MODEL}_gpu0_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu1_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu2_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu3_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu4_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu5_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu6_K${K}.log"
-echo "  logs/triplet_${MODEL}_gpu7_K${K}.log"
+for i in "${!GPU_PIDS[@]}"; do
+    OLD_IFS=$IFS
+    IFS=':' read -r gpu_id start_b end_b <<< "${GPU_INFO[$i]}"
+    IFS=$OLD_IFS
+    echo "  logs/triplet/${MODEL}_gpu${gpu_id}_K${K}.log"
+done

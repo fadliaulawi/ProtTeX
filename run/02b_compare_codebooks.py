@@ -315,8 +315,8 @@ Examples:
     )
     parser.add_argument(
         '--data-dir',
-        default='data',
-        help='Directory containing codebook summary files (default: data)'
+        default='data/codebooks',
+        help='Directory containing codebook summary files (default: data/codebooks)'
     )
     parser.add_argument(
         '--plot',
@@ -325,8 +325,8 @@ Examples:
     )
     parser.add_argument(
         '--output-dir',
-        default='data',
-        help='Directory for output plots (default: results)'
+        default='data/codebooks',
+        help='Directory for output plots (default: data/codebooks)'
     )
     
     args = parser.parse_args()
