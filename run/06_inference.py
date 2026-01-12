@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Tuple
 import argparse
 import warnings
 from tqdm import tqdm
@@ -29,6 +29,23 @@ warnings.filterwarnings('ignore')
 from transformers import AutoTokenizer, AutoModelForCausalLM, EsmModel
 from peft import PeftModel
 from rouge_score import rouge_scorer
+import re
+from collections import defaultdict
+
+# Try importing NLTK for BLEU
+try:
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    from nltk.tokenize import word_tokenize
+    import nltk
+    # Download required NLTK data if not present
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+    NLTK_AVAILABLE = True
+except ImportError:
+    print("⚠️  NLTK not available for BLEU computation. Install with: pip install nltk")
+    NLTK_AVAILABLE = False
 
 # Add root directory to Python path for imports
 script_dir = Path(__file__).parent
@@ -49,10 +66,8 @@ except ImportError:
     get_model_config = config_module.get_model_config
     list_available_models = config_module.list_available_models
 
-# Embedding dimensions (must match training)
+# Embedding dimensions
 ESM_HIDDEN_DIM = 2560  # ESM-2 3B
-# Model hidden dim will be set from config
-
 
 class ProteinProjectionHead(nn.Module):
     """Project protein embeddings to model space"""
@@ -268,6 +283,31 @@ class ProteinFunctionInference:
         self.baseline_model.eval()
         
         print("✅ Both models loaded (tri-modal with LoRA, plain model for baseline)")
+        
+        # Load llama-molinst-protein-7b for variant 6
+        print(f"\n📥 Loading llama-molinst-protein-7b for variant 6...")
+        try:
+            self.molinst_model_name = "zjunlp/llama-molinst-protein-7b"
+            self.molinst_tokenizer = AutoTokenizer.from_pretrained(
+                self.molinst_model_name,
+                trust_remote_code=True
+            )
+            if self.molinst_tokenizer.pad_token is None:
+                self.molinst_tokenizer.pad_token = self.molinst_tokenizer.eos_token
+            
+            self.molinst_model = AutoModelForCausalLM.from_pretrained(
+                self.molinst_model_name,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map={"": self.device},
+                trust_remote_code=True
+            )
+            self.molinst_model.eval()
+            print("✅ llama-molinst-protein-7b loaded")
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to load llama-molinst-protein-7b: {e}")
+            self.molinst_model = None
+            self.molinst_tokenizer = None
         
         # AA vocabulary for structure tokens
         self.aa_vocab = "ACDEFGHIKLMNPQRSTVWY"
@@ -748,23 +788,365 @@ class ProteinFunctionInference:
             return generated_text.strip()
         else:
             return ""
+    
+    def generate_molinst_protein(self,
+                                 sequence: str,
+                                 question: str = "What is the function of this protein?",
+                                 max_new_tokens: int = 256,
+                                 temperature: float = 0.7,
+                                 top_p: float = 0.9) -> str:
+        """
+        Variant 6: llama-molinst-protein-7b (protein-oriented instruction-tuned model).
+        Uses the pre-trained model fine-tuned on Mol-Instructions protein dataset.
+        
+        Args:
+            sequence: Protein sequence string
+            question: Question/prompt about the protein
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+        
+        Returns:
+            Generated function text
+        """
+        if self.molinst_model is None or self.molinst_tokenizer is None:
+            raise ValueError("llama-molinst-protein-7b model not loaded")
+        
+        sequence = sequence[:1024]  # Truncate for memory
+        
+        # Use proper chat template
+        messages = [
+            {"role": "user", "content": f"{question}\n\nSequence: {sequence}"}
+        ]
+        prompt = self.molinst_tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # Tokenize
+        inputs = self.molinst_tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        
+        # Get stop tokens
+        stop_token_ids = self._get_stop_token_ids(self.molinst_tokenizer)
+        pad_token_id = self.molinst_tokenizer.pad_token_id
+        
+        with torch.no_grad():
+            outputs = self.molinst_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=max(0.1, temperature),
+                top_p=top_p,
+                do_sample=(temperature > 0.1),
+                pad_token_id=pad_token_id,
+                eos_token_id=stop_token_ids,
+                use_cache=True
+            )
+        
+        # Decode generated tokens
+        prompt_length = inputs['input_ids'].shape[1]
+        
+        if outputs.shape[1] > prompt_length:
+            generated_ids = outputs[0, prompt_length:]
+            special_ids = set(stop_token_ids + [pad_token_id])
+            generated_ids = torch.tensor([t for t in generated_ids.tolist() if t not in special_ids], device=self.device)
+            
+            if len(generated_ids) == 0:
+                return ""
+            
+            generated_text = self.molinst_tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return generated_text.strip()
+        else:
+            return ""
+    
+    def generate_protex(self,
+                       sequence: str,
+                       question: str = "What is the function of this protein?",
+                       max_new_tokens: int = 256,
+                       temperature: float = 0.7,
+                       top_p: float = 0.9,
+                       protex_model_path: str = None,
+                       protex_character_aa_dict: str = None,
+                       protex_character_protoken: str = None) -> str:
+        """
+        Variant 7: ProtTeX model (requires full ProtTeX setup).
+        Uses ProtTeX format with protein sequence (AA tokens) and structure tokens (protoken).
+        
+        Based on function_inference.py, ProtTeX requires:
+        - AA tokens: sequence converted through character_aa_dict (typically same as sequence string)
+        - Structure tokens: protoken from code_indices converted through character_protoken
+        
+        Args:
+            sequence: Protein sequence string
+            question: Question/prompt about the protein
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            protex_model_path: Path to ProtTeX model (required)
+            protex_character_aa_dict: Path to character_aa_dict.pkl (required)
+            protex_character_protoken: Path to character.json (required)
+        
+        Returns:
+            Generated function text
+        """
+        if protex_model_path is None:
+            raise NotImplementedError(
+                "ProtTeX variant requires full ProtTeX setup. "
+                "Please provide --protex-model-path, --protex-character-aa-dict, and --protex-character-protoken. "
+                "ProtTeX requires: (1) PDB file tokenization via tokenize_pdb.py, "
+                "(2) character_aa_dict.pkl and character.json tokenizer metadata, "
+                "(3) ProtTeX model weights."
+            )
+        
+        # Full ProtTeX implementation would require:
+        # 1. Loading ProtTeX model and tokenizer
+        # 2. Loading character_aa_dict.pkl and character.json
+        # 3. Having pre-tokenized PDB files with code_indices
+        # 4. Converting sequence to AA tokens using character_aa_dict
+        # 5. Converting code_indices to protoken using character_protoken
+        # 6. Using ProtTeX template format
+        
+        raise NotImplementedError(
+            "Full ProtTeX model integration not yet implemented. "
+            "This requires: ProtTeX model weights, tokenizer metadata files, "
+            "and pre-processed PDB tokenization files."
+        )
+
+
+def compute_bleu(reference: str, hypothesis: str, n: int = 4) -> float:
+    """
+    Compute BLEU-n score between reference and hypothesis.
+    
+    Args:
+        reference: Ground truth text
+        hypothesis: Predicted text
+        n: N-gram order (1-4)
+    
+    Returns:
+        BLEU-n score (0-1)
+    """
+    if not reference or not hypothesis:
+        return 0.0
+    
+    if NLTK_AVAILABLE:
+        try:
+            ref_tokens = word_tokenize(reference.lower())
+            hyp_tokens = word_tokenize(hypothesis.lower())
+            
+            if n == 1:
+                weights = (1.0, 0, 0, 0)
+            elif n == 2:
+                weights = (0.5, 0.5, 0, 0)
+            elif n == 3:
+                weights = (0.33, 0.33, 0.33, 0)
+            else:  # n == 4
+                weights = (0.25, 0.25, 0.25, 0.25)
+            
+            smoothing = SmoothingFunction().method1
+            score = sentence_bleu([ref_tokens], hyp_tokens, weights=weights, smoothing_function=smoothing)
+            return float(score)
+        except Exception as e:
+            print(f"⚠️  Error computing BLEU with NLTK: {e}")
+            return compute_bleu_simple(reference, hypothesis, n)
+    else:
+        return compute_bleu_simple(reference, hypothesis, n)
+
+
+def compute_bleu_simple(reference: str, hypothesis: str, n: int = 4) -> float:
+    """
+    Simple BLEU computation without NLTK.
+    """
+    ref_tokens = reference.lower().split()
+    hyp_tokens = hypothesis.lower().split()
+    
+    if len(hyp_tokens) == 0:
+        return 0.0
+    
+    # Compute precision for each n-gram order
+    precisions = []
+    for i in range(1, n + 1):
+        ref_ngrams = defaultdict(int)
+        hyp_ngrams = defaultdict(int)
+        
+        # Count n-grams in reference
+        for j in range(len(ref_tokens) - i + 1):
+            ngram = tuple(ref_tokens[j:j+i])
+            ref_ngrams[ngram] += 1
+        
+        # Count n-grams in hypothesis
+        for j in range(len(hyp_tokens) - i + 1):
+            ngram = tuple(hyp_tokens[j:j+i])
+            hyp_ngrams[ngram] += 1
+        
+        # Compute clipped precision
+        matches = 0
+        for ngram, count in hyp_ngrams.items():
+            matches += min(count, ref_ngrams.get(ngram, 0))
+        
+        total = sum(hyp_ngrams.values())
+        if total == 0:
+            precisions.append(0.0)
+        else:
+            precisions.append(matches / total)
+    
+    # Geometric mean of precisions
+    if any(p == 0 for p in precisions):
+        return 0.0
+    
+    # Brevity penalty
+    bp = min(1.0, np.exp(1 - len(ref_tokens) / len(hyp_tokens))) if len(hyp_tokens) > 0 else 0.0
+    
+    # BLEU score
+    bleu = bp * (np.prod(precisions) ** (1.0 / len(precisions)))
+    return float(bleu)
+
+
+def extract_keywords(text: str) -> set:
+    """
+    Extract keywords/terms from text for EMJI calculation.
+    
+    Args:
+        text: Input text string
+    
+    Returns:
+        Set of lowercase keywords (words, excluding common stop words)
+    """
+    if not text or not isinstance(text, str):
+        return set()
+    
+    # Common stop words to exclude
+    stop_words = {
+        'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those',
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+        'in', 'on', 'at', 'by', 'for', 'with', 'from', 'to', 'of', 'as', 'and', 'or',
+        'but', 'not', 'if', 'then', 'else', 'when', 'where', 'why', 'how', 'what',
+        'which', 'who', 'whom', 'whose', 'about', 'into', 'through', 'during',
+        'before', 'after', 'above', 'below', 'up', 'down', 'out', 'off', 'over', 'under',
+        'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why',
+        'all', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+        'nor', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can',
+        'will', 'just', 'don', 'should', 'now'
+    }
+    
+    # Convert to lowercase and split into words
+    # Remove punctuation and split on whitespace
+    text_clean = re.sub(r'[^\w\s-]', ' ', text.lower())
+    words = text_clean.split()
+    
+    # Filter: keep words that are:
+    # - Not stop words
+    # - At least 2 characters long
+    # - Not pure numbers
+    keywords = set()
+    for word in words:
+        word = word.strip('-')
+        if (len(word) >= 2 and 
+            word not in stop_words and 
+            not word.isdigit() and
+            word.isalnum()):
+            keywords.add(word)
+    
+    return keywords
+
+
+def compute_emji(reference: str, hypothesis: str) -> float:
+    """
+    Compute EMJI (Exact Match Jaccard Index) between reference and hypothesis.
+    
+    EMJI = |A ∩ B| / |A ∪ B|
+    where A = keywords from reference, B = keywords from hypothesis
+    
+    Args:
+        reference: Ground truth text
+        hypothesis: Predicted text
+    
+    Returns:
+        EMJI score (0.0 to 1.0)
+    """
+    if not reference or not hypothesis:
+        return 0.0
+    
+    ref_keywords = extract_keywords(reference)
+    hyp_keywords = extract_keywords(hypothesis)
+    
+    if not ref_keywords and not hyp_keywords:
+        return 1.0  # Both empty, perfect match
+    
+    if not ref_keywords or not hyp_keywords:
+        return 0.0  # One is empty, no match
+    
+    # Jaccard Index: intersection / union
+    intersection = ref_keywords & hyp_keywords
+    union = ref_keywords | hyp_keywords
+    
+    if not union:
+        return 0.0
+    
+    emji = len(intersection) / len(union)
+    return float(emji)
+
+
+def load_triplet_batch(batch_file: Path, metadata_file: Path = None) -> Tuple[list, list]:
+    """
+    Load triplet embeddings from script 03 output (same as script 05).
+    
+    Args:
+        batch_file: Path to triplet_embeddings_batch_*.npz
+        metadata_file: Path to triplet_metadata_batch_*.json (optional)
+    
+    Returns:
+        (train_triplets, val_triplets, metadata)
+    """
+    # Load NPZ file
+    data = np.load(batch_file, allow_pickle=True)
+    
+    seq_embeddings = data['sequence_embeddings']
+    text_embeddings = data['text_embeddings']
+    structure_tokens = data['structure_tokens']
+    protein_ids = data['protein_ids']
+    
+    # Reconstruct triplets
+    triplets = []
+    for i in range(len(seq_embeddings)):
+        triplet = {
+            'sequence_embedding': seq_embeddings[i],
+            'text_embedding': text_embeddings[i],
+            'structure_tokens': structure_tokens[i],
+            'protein_id': str(protein_ids[i])
+        }
+        triplets.append(triplet)
+    
+    # Load metadata if available
+    metadata = []
+    if metadata_file and metadata_file.exists():
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+    
+    # Split sequentially (no shuffling, same as script 05)
+    n_val = int(len(triplets) * 0.1)
+    val_triplets = triplets[:n_val]
+    train_triplets = triplets[n_val:]
+    
+    return train_triplets, val_triplets, metadata
+
 
 def main():
+    
     parser = argparse.ArgumentParser(description='Protein function prediction inference')
     parser.add_argument('--model', type=str, required=True,
                        choices=list_available_models(),
                        help=f'Model type: {", ".join(list_available_models())}')
-    parser.add_argument('--k', type=int, default=128, help='K-means clusters (must match training)')
-    parser.add_argument('--input', type=str, default='run/input_inference.json', help='Input JSON file: List of objects with "id", "sequence", "question", "function" fields')
+    parser.add_argument('--k', type=int, required=True, help='K-means clusters (must match training)')
+    parser.add_argument('--input', type=str, required=True, help='Input JSON file: List of objects with "id", "sequence", "question", "function" fields')
     parser.add_argument('--output', type=str, default='run/output_inference.json', help='Output JSON file')
     parser.add_argument('--max-tokens', type=int, default=1024, help='Max tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
     parser.add_argument('--top-p', type=float, default=0.9, help='Nucleus sampling top-p')
     parser.add_argument('--test-base-only', action='store_true', help='Test base model without LoRA adapters')
-    parser.add_argument('--test-batches', type=int, default=4,
-                       help='Number of last batches held out during training (default: 4)')
     parser.add_argument('--variants', type=str, default='all',
-                       help='Variants to run (default: all). Options: "all", "1", "2", "3", "4", "5", or comma-separated like "1,3,5"')
+                       help='Variants to run (default: all). Options: "all", "1"-"7", or comma-separated like "1,3,5"')
     parser.add_argument('--start-index', type=int, default=None,
                        help='Start index for processing input list (for parallelization). If None, processes all.')
     parser.add_argument('--end-index', type=int, default=None,
@@ -776,12 +1158,12 @@ def main():
     
     # Parse variants argument
     if args.variants.lower() == 'all':
-        variants_to_run = [1, 2, 3, 4, 5]
+        variants_to_run = [1, 2, 3, 4, 5, 6, 7]
     else:
         try:
             variants_to_run = [int(v.strip()) for v in args.variants.split(',')]
-            if not all(1 <= v <= 5 for v in variants_to_run):
-                print("❌ Invalid variant numbers. Must be between 1 and 5.")
+            if not all(1 <= v <= 7 for v in variants_to_run):
+                print("❌ Invalid variant numbers. Must be between 1 and 7.")
                 return
         except ValueError:
             print(f"❌ Invalid variants format: {args.variants}. Use 'all' or comma-separated numbers like '1,3,5'")
@@ -791,18 +1173,17 @@ def main():
     model_config = get_model_config(args.model)
     k_clusters = args.k
     
-    # Paths (use model-specific paths)
+    # Paths (use model-specific paths with K{k_clusters} subdirectory)
     data_dir = Path('data')
-    lora_path = data_dir / f'lora/{model_config.output_dir_suffix}/K{k_clusters}_test{args.test_batches}/final_lora_K{k_clusters}'
+    lora_path = data_dir / f'lora/{model_config.output_dir_suffix}/K{k_clusters}/final_lora_K{k_clusters}'
     alignment_model_path = data_dir / f'clip_alignment/{args.model}_K{k_clusters}/best_model_K{k_clusters}.pt'
-    codebook_path = data_dir / f'structure_codebook_K{k_clusters}.pkl'
+    codebook_path = data_dir / 'codebooks' / f'structure_codebook_K{k_clusters}.pkl'
     
     print(f"=" * 70)
     print(f"PROTEIN FUNCTION PREDICTION INFERENCE")
     print(f"=" * 70)
     print(f"Model: {args.model} ({model_config.model_name})")
     print(f"K-means clusters: {k_clusters}")
-    print(f"Test batches held out: {args.test_batches}")
     
     # Validate paths (only if not testing base model)
     if not args.test_base_only:
@@ -822,7 +1203,8 @@ def main():
         print(f"   Run script 02_train_kmeans_codebook.py first!")
         return
     
-    # Load inputs (must be list format)
+    # Load inputs from file
+    print(f"\n📥 Loading inputs from file: {args.input}")
     with open(args.input, 'r') as f:
         input_data = json.load(f)
     
@@ -843,7 +1225,9 @@ def main():
             'id': item['id'],
             'sequence': item['sequence'],
             'question': item['question'],
-            'ground_truth_function': item.get('function', '')  # For comparison
+            'ground_truth_function': item.get('function', ''),
+            'subset': item.get('subset', ''),
+            'type': item.get('type', '')
         })
     
     # Slice inputs for parallelization if start/end indices provided
@@ -855,7 +1239,7 @@ def main():
         print(f"✅ Loaded {total_inputs} total sequences from {args.input}")
         print(f"📊 Processing subset: indices {start_idx} to {end_idx-1} ({len(inputs)} sequences)")
     else:
-    print(f"✅ Loaded {len(inputs)} sequences from {args.input}")
+        print(f"✅ Loaded {len(inputs)} sequences from {args.input}")
     
     # Initialize inference pipeline
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -880,28 +1264,32 @@ def main():
     output_file = str(output_file)  # Convert back to string for json.dump
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
     
-    # Single loop: process each input with all 5 variants, compute ROUGE, and save immediately
+    # Single loop: process each input with all variants, compute metrics (ROUGE, BLEU, EMJI), and save immediately
     results = []
-    rouge_scores = {
-        'variant1_plain_seq': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-        'variant2_plain_seq_struct': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-        'variant3_plain_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-        'variant4_finetuned_struct': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-        'variant5_finetuned_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': []}
+    metric_scores = {
+        'plain_seq': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'plain_seq_struct': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'plain_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'finetuned_struct': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'full_model': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'molinst_protein': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+        'protex': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []}
     }
     
     print(f"\n🚀 Running inference (Ablation Study)...")
     print(f"  Model: {args.model} ({model_config.model_name})")
     print(f"  Variants to run: {', '.join(map(str, variants_to_run))}")
     variant_descriptions = {
-        1: "Variant 1: Plain model (question + sequence) - Baseline",
-        2: "Variant 2: Plain model (question + sequence + structure as text)",
-        3: "Variant 3: Plain model (question + sequence + structure + embeddings)",
-        4: "Variant 4: Fine-tuned model (question + sequence + structure as text, no embeddings)",
-        5: "Variant 5: Fine-tuned model (question + sequence + structure + embeddings) - Full Model"
+        1: "Plain model (question + sequence) - Baseline",
+        2: "Plain model (question + sequence + structure as text)",
+        3: "Plain model (question + sequence + structure + embeddings)",
+        4: "Fine-tuned model (question + sequence + structure as text, no embeddings)",
+        5: "Fine-tuned model (question + sequence + structure + embeddings) - Full Model",
+        6: "llama-molinst-protein-7b (protein-oriented instruction-tuned)",
+        7: "ProtTeX (sequence + structure tokens)"
     }
     for v in variants_to_run:
-        print(f"  {variant_descriptions[v]}")
+        print(f"  Variant {v}: {variant_descriptions[v]}")
     
     for item in tqdm(inputs, desc="Processing samples"):
         result = {
@@ -911,238 +1299,334 @@ def main():
             "ground_truth_function": item['ground_truth_function']
         }
         
+        # Preserve subset and type if present
+        if item.get('subset'):
+            result['subset'] = item['subset']
+        if item.get('type'):
+            result['type'] = item['type']
+        
         gt = result.get('ground_truth_function', '')
         
         # Variant 1: Plain model (question + sequence)
         if 1 in variants_to_run:
-        try:
-            pred_v1 = pipeline.generate_plain_llama(
-                item['sequence'],
-                question=item['question'],
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p
-            )
-            result["predicted_function_variant1"] = pred_v1
-            if gt and pred_v1 and not pred_v1.startswith('ERROR'):
-                scores = scorer.score(gt, pred_v1)
-                result['rouge_variant1'] = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                }
-                rouge_scores['variant1_plain_seq']['rouge1'].append(scores['rouge1'].fmeasure)
-                rouge_scores['variant1_plain_seq']['rouge2'].append(scores['rouge2'].fmeasure)
-                rouge_scores['variant1_plain_seq']['rougeL'].append(scores['rougeL'].fmeasure)
-            else:
-                result['rouge_variant1'] = None
-        except Exception as e:
-            print(f"\n⚠️  Error processing {item['id']} (variant 1): {e}")
-            result["predicted_function_variant1"] = f"ERROR: {str(e)}"
-                result['rouge_variant1'] = None
+            try:
+                pred_v1 = pipeline.generate_plain_llama(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_plain_seq"] = pred_v1
+                if gt and pred_v1 and not pred_v1.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v1)
+                    bleu_score = compute_bleu(gt, pred_v1, n=4)
+                    emji_score = compute_emji(gt, pred_v1)
+                    result['metrics_plain_seq'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['plain_seq']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['plain_seq']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['plain_seq']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['plain_seq']['bleu'].append(bleu_score)
+                    metric_scores['plain_seq']['emji'].append(emji_score)
+                else:
+                    result['metrics_plain_seq'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (plain_seq): {e}")
+                result["predicted_function_plain_seq"] = f"ERROR: {str(e)}"
+                result['metrics_plain_seq'] = None
         else:
-            result["predicted_function_variant1"] = "SKIPPED"
-            result['rouge_variant1'] = None
+            result["predicted_function_plain_seq"] = "SKIPPED"
+            result['metrics_plain_seq'] = None
         
         # Variant 2: Plain model (question + sequence + structure)
         if 2 in variants_to_run:
-        try:
-            pred_v2 = pipeline.generate_plain_llama_with_structure(
-                item['sequence'],
-                question=item['question'],
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p
-            )
-            result["predicted_function_variant2"] = pred_v2
-            if gt and pred_v2 and not pred_v2.startswith('ERROR'):
-                scores = scorer.score(gt, pred_v2)
-                result['rouge_variant2'] = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                }
-                rouge_scores['variant2_plain_seq_struct']['rouge1'].append(scores['rouge1'].fmeasure)
-                rouge_scores['variant2_plain_seq_struct']['rouge2'].append(scores['rouge2'].fmeasure)
-                rouge_scores['variant2_plain_seq_struct']['rougeL'].append(scores['rougeL'].fmeasure)
-            else:
-                result['rouge_variant2'] = None
-        except Exception as e:
-            print(f"\n⚠️  Error processing {item['id']} (variant 2): {e}")
-            result["predicted_function_variant2"] = f"ERROR: {str(e)}"
-                result['rouge_variant2'] = None
+            try:
+                pred_v2 = pipeline.generate_plain_llama_with_structure(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_plain_seq_struct"] = pred_v2
+                if gt and pred_v2 and not pred_v2.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v2)
+                    bleu_score = compute_bleu(gt, pred_v2, n=4)
+                    emji_score = compute_emji(gt, pred_v2)
+                    result['metrics_plain_seq_struct'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['plain_seq_struct']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['plain_seq_struct']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['plain_seq_struct']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['plain_seq_struct']['bleu'].append(bleu_score)
+                    metric_scores['plain_seq_struct']['emji'].append(emji_score)
+                else:
+                    result['metrics_plain_seq_struct'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (plain_seq_struct): {e}")
+                result["predicted_function_plain_seq_struct"] = f"ERROR: {str(e)}"
+                result['metrics_plain_seq_struct'] = None
         else:
-            result["predicted_function_variant2"] = "SKIPPED"
-            result['rouge_variant2'] = None
+            result["predicted_function_plain_seq_struct"] = "SKIPPED"
+            result['metrics_plain_seq_struct'] = None
         
         # Variant 3: Plain model (question + sequence + structure + embeddings)
         if 3 in variants_to_run:
-        try:
-            pred_v3 = pipeline.generate_plain_llama_with_embeddings(
-                item['sequence'],
-                question=item['question'],
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p
-            )
-            result["predicted_function_variant3"] = pred_v3
-            if gt and pred_v3 and not pred_v3.startswith('ERROR'):
-                scores = scorer.score(gt, pred_v3)
-                result['rouge_variant3'] = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                }
-                rouge_scores['variant3_plain_embeddings']['rouge1'].append(scores['rouge1'].fmeasure)
-                rouge_scores['variant3_plain_embeddings']['rouge2'].append(scores['rouge2'].fmeasure)
-                rouge_scores['variant3_plain_embeddings']['rougeL'].append(scores['rougeL'].fmeasure)
-            else:
-                result['rouge_variant3'] = None
-        except Exception as e:
-            print(f"\n⚠️  Error processing {item['id']} (variant 3): {e}")
-            result["predicted_function_variant3"] = f"ERROR: {str(e)}"
-                result['rouge_variant3'] = None
+            try:
+                pred_v3 = pipeline.generate_plain_llama_with_embeddings(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_plain_embeddings"] = pred_v3
+                if gt and pred_v3 and not pred_v3.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v3)
+                    bleu_score = compute_bleu(gt, pred_v3, n=4)
+                    emji_score = compute_emji(gt, pred_v3)
+                    result['metrics_plain_embeddings'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['plain_embeddings']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['plain_embeddings']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['plain_embeddings']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['plain_embeddings']['bleu'].append(bleu_score)
+                    metric_scores['plain_embeddings']['emji'].append(emji_score)
+                else:
+                    result['metrics_plain_embeddings'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (plain_embeddings): {e}")
+                result["predicted_function_plain_embeddings"] = f"ERROR: {str(e)}"
+                result['metrics_plain_embeddings'] = None
         else:
-            result["predicted_function_variant3"] = "SKIPPED"
-            result['rouge_variant3'] = None
+            result["predicted_function_plain_embeddings"] = "SKIPPED"
+            result['metrics_plain_embeddings'] = None
         
         # Variant 4: Fine-tuned model (question + sequence + structure as text, no embeddings)
         if 4 in variants_to_run:
-        try:
-            pred_v4 = pipeline.generate_finetuned_llama_with_structure(
-                item['sequence'],
-                question=item['question'],
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p
-            )
-            result["predicted_function_variant4"] = pred_v4
-            if gt and pred_v4 and not pred_v4.startswith('ERROR'):
-                scores = scorer.score(gt, pred_v4)
-                result['rouge_variant4'] = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                }
-                rouge_scores['variant4_finetuned_struct']['rouge1'].append(scores['rouge1'].fmeasure)
-                rouge_scores['variant4_finetuned_struct']['rouge2'].append(scores['rouge2'].fmeasure)
-                rouge_scores['variant4_finetuned_struct']['rougeL'].append(scores['rougeL'].fmeasure)
-            else:
-                result['rouge_variant4'] = None
-        except Exception as e:
-            print(f"\n⚠️  Error processing {item['id']} (variant 4): {e}")
-            result["predicted_function_variant4"] = f"ERROR: {str(e)}"
-                result['rouge_variant4'] = None
+            try:
+                pred_v4 = pipeline.generate_finetuned_llama_with_structure(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_finetuned_struct"] = pred_v4
+                if gt and pred_v4 and not pred_v4.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v4)
+                    bleu_score = compute_bleu(gt, pred_v4, n=4)
+                    emji_score = compute_emji(gt, pred_v4)
+                    result['metrics_finetuned_struct'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['finetuned_struct']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['finetuned_struct']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['finetuned_struct']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['finetuned_struct']['bleu'].append(bleu_score)
+                    metric_scores['finetuned_struct']['emji'].append(emji_score)
+                else:
+                    result['metrics_finetuned_struct'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (finetuned_struct): {e}")
+                result["predicted_function_finetuned_struct"] = f"ERROR: {str(e)}"
+                result['metrics_finetuned_struct'] = None
         else:
-            result["predicted_function_variant4"] = "SKIPPED"
-            result['rouge_variant4'] = None
+            result["predicted_function_finetuned_struct"] = "SKIPPED"
+            result['metrics_finetuned_struct'] = None
         
         # Variant 5: Fine-tuned model (question + sequence + structure + embeddings) - Full Model
         if 5 in variants_to_run:
-        try:
-            pred_v5 = pipeline.generate(
-                item['sequence'],
-                question=item['question'],
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p
-            )
-            result["predicted_function_variant5"] = pred_v5
-            if gt and pred_v5 and not pred_v5.startswith('ERROR'):
-                scores = scorer.score(gt, pred_v5)
-                result['rouge_variant5'] = {
-                    'rouge1': scores['rouge1'].fmeasure,
-                    'rouge2': scores['rouge2'].fmeasure,
-                    'rougeL': scores['rougeL'].fmeasure,
-                }
-                rouge_scores['variant5_finetuned_embeddings']['rouge1'].append(scores['rouge1'].fmeasure)
-                rouge_scores['variant5_finetuned_embeddings']['rouge2'].append(scores['rouge2'].fmeasure)
-                rouge_scores['variant5_finetuned_embeddings']['rougeL'].append(scores['rougeL'].fmeasure)
-            else:
-                result['rouge_variant5'] = None
-        except Exception as e:
-            print(f"\n⚠️  Error processing {item['id']} (variant 5): {e}")
-            result["predicted_function_variant5"] = f"ERROR: {str(e)}"
-                result['rouge_variant5'] = None
+            try:
+                pred_v5 = pipeline.generate(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_full_model"] = pred_v5
+                if gt and pred_v5 and not pred_v5.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v5)
+                    bleu_score = compute_bleu(gt, pred_v5, n=4)
+                    emji_score = compute_emji(gt, pred_v5)
+                    result['metrics_full_model'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['full_model']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['full_model']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['full_model']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['full_model']['bleu'].append(bleu_score)
+                    metric_scores['full_model']['emji'].append(emji_score)
+                else:
+                    result['metrics_full_model'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (full_model): {e}")
+                result["predicted_function_full_model"] = f"ERROR: {str(e)}"
+                result['metrics_full_model'] = None
         else:
-            result["predicted_function_variant5"] = "SKIPPED"
-            result['rouge_variant5'] = None
+            result["predicted_function_full_model"] = "SKIPPED"
+            result['metrics_full_model'] = None
+        
+        # Variant 6: llama-molinst-protein-7b
+        if 6 in variants_to_run:
+            try:
+                pred_v6 = pipeline.generate_molinst_protein(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_molinst_protein"] = pred_v6
+                if gt and pred_v6 and not pred_v6.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v6)
+                    bleu_score = compute_bleu(gt, pred_v6, n=4)
+                    emji_score = compute_emji(gt, pred_v6)
+                    result['metrics_molinst_protein'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['molinst_protein']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['molinst_protein']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['molinst_protein']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['molinst_protein']['bleu'].append(bleu_score)
+                    metric_scores['molinst_protein']['emji'].append(emji_score)
+                else:
+                    result['metrics_molinst_protein'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (molinst_protein): {e}")
+                result["predicted_function_molinst_protein"] = f"ERROR: {str(e)}"
+                result['metrics_molinst_protein'] = None
+        else:
+            result["predicted_function_molinst_protein"] = "SKIPPED"
+            result['metrics_molinst_protein'] = None
+        
+        # Variant 7: ProtTeX
+        if 7 in variants_to_run:
+            try:
+                pred_v7 = pipeline.generate_protex(
+                    item['sequence'],
+                    question=item['question'],
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p
+                )
+                result["predicted_function_protex"] = pred_v7
+                if gt and pred_v7 and not pred_v7.startswith('ERROR'):
+                    scores = scorer.score(gt, pred_v7)
+                    bleu_score = compute_bleu(gt, pred_v7, n=4)
+                    emji_score = compute_emji(gt, pred_v7)
+                    result['metrics_protex'] = {
+                        'rouge1': scores['rouge1'].fmeasure,
+                        'rouge2': scores['rouge2'].fmeasure,
+                        'rougeL': scores['rougeL'].fmeasure,
+                        'bleu': bleu_score,
+                        'emji': emji_score,
+                    }
+                    metric_scores['protex']['rouge1'].append(scores['rouge1'].fmeasure)
+                    metric_scores['protex']['rouge2'].append(scores['rouge2'].fmeasure)
+                    metric_scores['protex']['rougeL'].append(scores['rougeL'].fmeasure)
+                    metric_scores['protex']['bleu'].append(bleu_score)
+                    metric_scores['protex']['emji'].append(emji_score)
+                else:
+                    result['metrics_protex'] = None
+            except Exception as e:
+                print(f"\n⚠️  Error processing {item['id']} (protex): {e}")
+                result["predicted_function_protex"] = f"ERROR: {str(e)}"
+                result['metrics_protex'] = None
+        else:
+            result["predicted_function_protex"] = "SKIPPED"
+            result['metrics_protex'] = None
         
         # Add to results
         results.append(result)
         
-        # Compute current averages for summary
-        def compute_avg_rouge(variant_scores):
-            return {
-                'avg_rouge1': float(np.mean(variant_scores['rouge1'])) if variant_scores['rouge1'] else 0,
-                'avg_rouge2': float(np.mean(variant_scores['rouge2'])) if variant_scores['rouge2'] else 0,
-                'avg_rougeL': float(np.mean(variant_scores['rougeL'])) if variant_scores['rougeL'] else 0,
-            }
-        
-        # Summary evaluation metrics
-        evaluation_metrics = {
-            'variant1_plain_seq': {
-                'n_samples': len(rouge_scores['variant1_plain_seq']['rouge1']),
-                **compute_avg_rouge(rouge_scores['variant1_plain_seq'])
-            },
-            'variant2_plain_seq_struct': {
-                'n_samples': len(rouge_scores['variant2_plain_seq_struct']['rouge1']),
-                **compute_avg_rouge(rouge_scores['variant2_plain_seq_struct'])
-            },
-            'variant3_plain_embeddings': {
-                'n_samples': len(rouge_scores['variant3_plain_embeddings']['rouge1']),
-                **compute_avg_rouge(rouge_scores['variant3_plain_embeddings'])
-            },
-            'variant4_finetuned_struct': {
-                'n_samples': len(rouge_scores['variant4_finetuned_struct']['rouge1']),
-                **compute_avg_rouge(rouge_scores['variant4_finetuned_struct'])
-            },
-            'variant5_finetuned_embeddings': {
-                'n_samples': len(rouge_scores['variant5_finetuned_embeddings']['rouge1']),
-                **compute_avg_rouge(rouge_scores['variant5_finetuned_embeddings'])
-            }
-        }
-        
-        # Write JSON after each iteration (overwrite)
+        # Write JSON after each iteration (overwrite) - only save results, no averages
         output_data = {
-            'results': results,
-            'evaluation_summary': evaluation_metrics
+            'results': results
         }
         with open(output_file, 'w') as f:
             json.dump(output_data, f, indent=2)
     
     print(f"\n✅ Results saved to {output_file}")
     
-    # Compute final summary metrics
+    # Compute final summary metrics (only at the end)
     def compute_final_avg(variant_scores):
         return {
             'avg_rouge1': float(np.mean(variant_scores['rouge1'])) if variant_scores['rouge1'] else 0,
             'avg_rouge2': float(np.mean(variant_scores['rouge2'])) if variant_scores['rouge2'] else 0,
             'avg_rougeL': float(np.mean(variant_scores['rougeL'])) if variant_scores['rougeL'] else 0,
+            'avg_bleu': float(np.mean(variant_scores['bleu'])) if variant_scores['bleu'] else 0,
+            'avg_emji': float(np.mean(variant_scores['emji'])) if variant_scores['emji'] else 0,
         }
     
-    final_eval = {
-        'variant1_plain_seq': {
-            'n_samples': len(rouge_scores['variant1_plain_seq']['rouge1']),
-            **compute_final_avg(rouge_scores['variant1_plain_seq'])
+    evaluation_summary = {
+        'plain_seq': {
+            'n_samples': len(metric_scores['plain_seq']['rouge1']),
+            **compute_final_avg(metric_scores['plain_seq'])
         },
-        'variant2_plain_seq_struct': {
-            'n_samples': len(rouge_scores['variant2_plain_seq_struct']['rouge1']),
-            **compute_final_avg(rouge_scores['variant2_plain_seq_struct'])
+        'plain_seq_struct': {
+            'n_samples': len(metric_scores['plain_seq_struct']['rouge1']),
+            **compute_final_avg(metric_scores['plain_seq_struct'])
         },
-        'variant3_plain_embeddings': {
-            'n_samples': len(rouge_scores['variant3_plain_embeddings']['rouge1']),
-            **compute_final_avg(rouge_scores['variant3_plain_embeddings'])
+        'plain_embeddings': {
+            'n_samples': len(metric_scores['plain_embeddings']['rouge1']),
+            **compute_final_avg(metric_scores['plain_embeddings'])
         },
-        'variant4_finetuned_struct': {
-            'n_samples': len(rouge_scores['variant4_finetuned_struct']['rouge1']),
-            **compute_final_avg(rouge_scores['variant4_finetuned_struct'])
+        'finetuned_struct': {
+            'n_samples': len(metric_scores['finetuned_struct']['rouge1']),
+            **compute_final_avg(metric_scores['finetuned_struct'])
         },
-        'variant5_finetuned_embeddings': {
-            'n_samples': len(rouge_scores['variant5_finetuned_embeddings']['rouge1']),
-            **compute_final_avg(rouge_scores['variant5_finetuned_embeddings'])
+        'full_model': {
+            'n_samples': len(metric_scores['full_model']['rouge1']),
+            **compute_final_avg(metric_scores['full_model'])
+        },
+        'molinst_protein': {
+            'n_samples': len(metric_scores['molinst_protein']['rouge1']),
+            **compute_final_avg(metric_scores['molinst_protein'])
+        },
+        'protex': {
+            'n_samples': len(metric_scores['protex']['rouge1']),
+            **compute_final_avg(metric_scores['protex'])
         }
     }
+    
+    # Write final output with evaluation summary
+    final_output_data = {
+        'results': results,
+        'evaluation_summary': evaluation_summary
+    }
+    with open(output_file, 'w') as f:
+        json.dump(final_output_data, f, indent=2)
+    print(f"✅ Final results with evaluation summary saved to {output_file}")
     
     # Compare predictions with ground truth
     print(f"\n📊 Comparison Summary:")
@@ -1150,19 +1634,23 @@ def main():
     print(f"   Total sequences: {len(results)}")
     
     variant_names = {
-        'variant1_plain_seq': 'V1: Plain (seq)',
-        'variant2_plain_seq_struct': 'V2: Plain (seq+struct)',
-        'variant3_plain_embeddings': 'V3: Plain (embeddings)',
-        'variant4_finetuned_struct': 'V4: Fine-tuned (struct)',
-        'variant5_finetuned_embeddings': 'V5: Fine-tuned (embeddings)'
+        'plain_seq': 'Plain (seq)',
+        'plain_seq_struct': 'Plain (seq+struct)',
+        'plain_embeddings': 'Plain (embeddings)',
+        'finetuned_struct': 'Fine-tuned (struct)',
+        'full_model': 'Full Model',
+        'molinst_protein': 'MolInst-Protein',
+        'protex': 'ProtTeX'
     }
     
     variant_pred_keys = {
-        'variant1_plain_seq': 'predicted_function_variant1',
-        'variant2_plain_seq_struct': 'predicted_function_variant2',
-        'variant3_plain_embeddings': 'predicted_function_variant3',
-        'variant4_finetuned_struct': 'predicted_function_variant4',
-        'variant5_finetuned_embeddings': 'predicted_function_variant5'
+        'plain_seq': 'predicted_function_plain_seq',
+        'plain_seq_struct': 'predicted_function_plain_seq_struct',
+        'plain_embeddings': 'predicted_function_plain_embeddings',
+        'finetuned_struct': 'predicted_function_finetuned_struct',
+        'full_model': 'predicted_function_full_model',
+        'molinst_protein': 'predicted_function_molinst_protein',
+        'protex': 'predicted_function_protex'
     }
     
     for variant_key, variant_name in variant_names.items():
@@ -1173,23 +1661,24 @@ def main():
         print(f"     Successful: {len(successful)}")
         print(f"     Errors: {errors}")
     
-    # Print ROUGE evaluation
-    print(f"\n📈 ROUGE Evaluation (Ablation Study):")
+    # Print evaluation metrics
+    print(f"\n📈 Evaluation Metrics (Ablation Study):")
     print(f"=" * 70)
-    print(f"\n   {'Metric':<12} {'V1':<10} {'V2':<10} {'V3':<10} {'V4':<10} {'V5':<10}")
-    print(f"   {'':<12} {'(seq)':<10} {'(seq+st)':<10} {'(emb)':<10} {'(ft+st)':<10} {'(ft+emb)':<10}")
-    print(f"   {'-'*62}")
-    for metric in ['rouge1', 'rouge2', 'rougeL']:
-        v1_score = final_eval['variant1_plain_seq'][f'avg_{metric}']
-        v2_score = final_eval['variant2_plain_seq_struct'][f'avg_{metric}']
-        v3_score = final_eval['variant3_plain_embeddings'][f'avg_{metric}']
-        v4_score = final_eval['variant4_finetuned_struct'][f'avg_{metric}']
-        v5_score = final_eval['variant5_finetuned_embeddings'][f'avg_{metric}']
-        print(f"   {metric.upper():<12} {v1_score:.4f}{'':>4} {v2_score:.4f}{'':>4} {v3_score:.4f}{'':>4} {v4_score:.4f}{'':>4} {v5_score:.4f}{'':>4}")
+    print(f"\n   {'Metric':<12} {'Plain':<10} {'Plain+St':<10} {'Plain+Emb':<10} {'FT+St':<10} {'Full':<10} {'MolInst':<10} {'ProtTeX':<10}")
+    print(f"   {'-'*92}")
+    for metric in ['rouge1', 'rouge2', 'rougeL', 'bleu', 'emji']:
+        v1_score = evaluation_summary['plain_seq'][f'avg_{metric}']
+        v2_score = evaluation_summary['plain_seq_struct'][f'avg_{metric}']
+        v3_score = evaluation_summary['plain_embeddings'][f'avg_{metric}']
+        v4_score = evaluation_summary['finetuned_struct'][f'avg_{metric}']
+        v5_score = evaluation_summary['full_model'][f'avg_{metric}']
+        v6_score = evaluation_summary['molinst_protein'][f'avg_{metric}']
+        v7_score = evaluation_summary['protex'][f'avg_{metric}']
+        print(f"   {metric.upper():<12} {v1_score:.4f}{'':>4} {v2_score:.4f}{'':>4} {v3_score:.4f}{'':>4} {v4_score:.4f}{'':>4} {v5_score:.4f}{'':>4} {v6_score:.4f}{'':>4} {v7_score:.4f}{'':>4}")
     
     print(f"\n   Samples evaluated:")
     for variant_key, variant_name in variant_names.items():
-        n_samples = final_eval[variant_key]['n_samples']
+        n_samples = evaluation_summary[variant_key]['n_samples']
         print(f"     {variant_name}: {n_samples}")
 
 

@@ -2,16 +2,14 @@
 
 # Parallel Inference Script
 # Distributes inference workload across 8 GPUs
-# Requires --model, --input, and --output arguments
-# Optionally accepts --k, --variants, --test-batches
+# Requires --model, --input, --output, --k, and --variants arguments
 
 # Parse arguments
 MODEL=""
 INPUT=""
 OUTPUT=""
-K="128"
-VARIANTS="all"
-TEST_BATCHES="4"
+K=""
+VARIANTS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,20 +33,16 @@ while [[ $# -gt 0 ]]; do
             VARIANTS="$2"
             shift 2
             ;;
-        --test-batches)
-            TEST_BATCHES="$2"
-            shift 2
-            ;;
         *)
             echo "Unknown option: $1"
             echo ""
-            echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> [--k <K>] [--variants <variants>] [--test-batches <N>]"
+            echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
             echo ""
             echo "Available models: llama, qwen, deepseek"
             echo ""
             echo "Examples:"
-            echo "  $0 --model deepseek --input run/input_inference.json --output run/output_inference.json"
-            echo "  $0 --model qwen --input run/input_inference.json --output run/output_inference.json --k 128 --variants 1,5"
+            echo "  $0 --model deepseek --input data/evaluation/deepseek/K128/test_data.json --output run/output_inference.json --k 128 --variants all"
+            echo "  $0 --model qwen --input data/evaluation/qwen/K1024/test_data.json --output run/output_inference.json --k 1024 --variants 1,5"
             exit 1
             ;;
     esac
@@ -58,23 +52,41 @@ done
 if [ -z "$MODEL" ]; then
     echo "Error: --model argument is required"
     echo ""
-    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> [other_args...]"
+    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
     exit 1
 fi
 
 if [ -z "$INPUT" ]; then
     echo "Error: --input argument is required"
     echo ""
-    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> [other_args...]"
+    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
     exit 1
 fi
 
 if [ -z "$OUTPUT" ]; then
     echo "Error: --output argument is required"
     echo ""
-    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> [other_args...]"
+    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
     exit 1
 fi
+
+if [ -z "$K" ]; then
+    echo "Error: --k argument is required"
+    echo ""
+    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
+    exit 1
+fi
+
+if [ -z "$VARIANTS" ]; then
+    echo "Error: --variants argument is required"
+    echo ""
+    echo "Usage: $0 --model <model_type> --input <input_file> --output <output_file> --k <K> --variants <variants>"
+    exit 1
+fi
+
+# Ensure logs directory exists (model-specific with K subdirectory)
+LOG_DIR="logs/inference/${MODEL}/K${K}"
+mkdir -p "$LOG_DIR"
 
 # Get total number of items in input JSON
 TOTAL_ITEMS=$(python3 -c "import json; data = json.load(open('$INPUT')); print(len(data) if isinstance(data, list) else 0)")
@@ -103,7 +115,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 0 (items $START0-$((END0-1)))..."
-CUDA_VISIBLE_DEVICES=0 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START0 --end-index $END0 --gpu-id 0 > logs/inference/${MODEL}_gpu0_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START0 --end-index $END0 --gpu-id 0 > ${LOG_DIR}/gpu0.log 2>&1 &
 PID0=$!
 
 # GPU 1
@@ -114,7 +126,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 1 (items $START1-$((END1-1)))..."
-CUDA_VISIBLE_DEVICES=1 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START1 --end-index $END1 --gpu-id 1 > logs/inference/${MODEL}_gpu1_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START1 --end-index $END1 --gpu-id 1 > ${LOG_DIR}/gpu1.log 2>&1 &
 PID1=$!
 
 # GPU 2
@@ -125,7 +137,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 2 (items $START2-$((END2-1)))..."
-CUDA_VISIBLE_DEVICES=2 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START2 --end-index $END2 --gpu-id 2 > logs/inference/${MODEL}_gpu2_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=2 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START2 --end-index $END2 --gpu-id 2 > ${LOG_DIR}/gpu2.log 2>&1 &
 PID2=$!
 
 # GPU 3
@@ -136,7 +148,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 3 (items $START3-$((END3-1)))..."
-CUDA_VISIBLE_DEVICES=3 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START3 --end-index $END3 --gpu-id 3 > logs/inference/${MODEL}_gpu3_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=3 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START3 --end-index $END3 --gpu-id 3 > ${LOG_DIR}/gpu3.log 2>&1 &
 PID3=$!
 
 # GPU 4
@@ -147,7 +159,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 4 (items $START4-$((END4-1)))..."
-CUDA_VISIBLE_DEVICES=4 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START4 --end-index $END4 --gpu-id 4 > logs/inference/${MODEL}_gpu4_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=4 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START4 --end-index $END4 --gpu-id 4 > ${LOG_DIR}/gpu4.log 2>&1 &
 PID4=$!
 
 # GPU 5
@@ -158,7 +170,7 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 5 (items $START5-$((END5-1)))..."
-CUDA_VISIBLE_DEVICES=5 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START5 --end-index $END5 --gpu-id 5 > logs/inference/${MODEL}_gpu5_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=5 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START5 --end-index $END5 --gpu-id 5 > ${LOG_DIR}/gpu5.log 2>&1 &
 PID5=$!
 
 # GPU 6
@@ -169,30 +181,29 @@ if [ $REMAINDER -gt 0 ]; then
     REMAINDER=$((REMAINDER - 1))
 fi
 echo "Starting GPU 6 (items $START6-$((END6-1)))..."
-CUDA_VISIBLE_DEVICES=6 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START6 --end-index $END6 --gpu-id 6 > logs/inference/${MODEL}_gpu6_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=6 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START6 --end-index $END6 --gpu-id 6 > ${LOG_DIR}/gpu6.log 2>&1 &
 PID6=$!
 
 # GPU 7
 START7=$END6
 END7=$TOTAL_ITEMS
 echo "Starting GPU 7 (items $START7-$((END7-1)))..."
-CUDA_VISIBLE_DEVICES=7 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --test-batches $TEST_BATCHES --start-index $START7 --end-index $END7 --gpu-id 7 > logs/inference/${MODEL}_gpu7_K${K}.log 2>&1 &
+CUDA_VISIBLE_DEVICES=7 python -u run/06_inference.py --model $MODEL --k $K --input "$INPUT" --output "$OUTPUT" --variants "$VARIANTS" --start-index $START7 --end-index $END7 --gpu-id 7 > ${LOG_DIR}/gpu7.log 2>&1 &
 PID7=$!
 
 echo ""
 echo "All 8 processes started!"
-echo "  GPU 0 (PID $PID0): items $START0-$((END0-1)) -> logs/inference/${MODEL}_gpu0_K${K}.log"
-echo "  GPU 1 (PID $PID1): items $START1-$((END1-1)) -> logs/inference/${MODEL}_gpu1_K${K}.log"
-echo "  GPU 2 (PID $PID2): items $START2-$((END2-1)) -> logs/inference/${MODEL}_gpu2_K${K}.log"
-echo "  GPU 3 (PID $PID3): items $START3-$((END3-1)) -> logs/inference/${MODEL}_gpu3_K${K}.log"
-echo "  GPU 4 (PID $PID4): items $START4-$((END4-1)) -> logs/inference/${MODEL}_gpu4_K${K}.log"
-echo "  GPU 5 (PID $PID5): items $START5-$((END5-1)) -> logs/inference/${MODEL}_gpu5_K${K}.log"
-echo "  GPU 6 (PID $PID6): items $START6-$((END6-1)) -> logs/inference/${MODEL}_gpu6_K${K}.log"
-echo "  GPU 7 (PID $PID7): items $START7-$((END7-1)) -> logs/inference/${MODEL}_gpu7_K${K}.log"
+echo "  GPU 0 (PID $PID0): items $START0-$((END0-1)) -> ${LOG_DIR}/gpu0.log"
+echo "  GPU 1 (PID $PID1): items $START1-$((END1-1)) -> ${LOG_DIR}/gpu1.log"
+echo "  GPU 2 (PID $PID2): items $START2-$((END2-1)) -> ${LOG_DIR}/gpu2.log"
+echo "  GPU 3 (PID $PID3): items $START3-$((END3-1)) -> ${LOG_DIR}/gpu3.log"
+echo "  GPU 4 (PID $PID4): items $START4-$((END4-1)) -> ${LOG_DIR}/gpu4.log"
+echo "  GPU 5 (PID $PID5): items $START5-$((END5-1)) -> ${LOG_DIR}/gpu5.log"
+echo "  GPU 6 (PID $PID6): items $START6-$((END6-1)) -> ${LOG_DIR}/gpu6.log"
+echo "  GPU 7 (PID $PID7): items $START7-$((END7-1)) -> ${LOG_DIR}/gpu7.log"
 echo ""
 echo "Monitor progress:"
-echo "  tail -f logs/inference/${MODEL}_gpu0_K${K}.log"
-echo "  tail -f logs/inference/${MODEL}_gpu1_K${K}.log"
+echo "  tail -f ${LOG_DIR}/gpu*.log"
 echo ""
 echo "Waiting for all processes to complete..."
 
@@ -231,12 +242,33 @@ output_ext = "$OUTPUT_EXT"
 
 # Load all GPU results
 all_results = []
-all_rouge_scores = {
-    'variant1_plain_seq': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-    'variant2_plain_seq_struct': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-    'variant3_plain_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-    'variant4_finetuned_struct': {'rouge1': [], 'rouge2': [], 'rougeL': []},
-    'variant5_finetuned_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': []}
+all_metric_scores = {
+    'plain_seq': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'plain_seq_struct': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'plain_embeddings': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'finetuned_struct': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'full_model': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'molinst_protein': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []},
+    'protex': {'rouge1': [], 'rouge2': [], 'rougeL': [], 'bleu': [], 'emji': []}
+}
+
+# Map result keys to variant keys (support both old rouge_* and new metrics_* naming)
+variant_mapping = {
+    'metrics_plain_seq': 'plain_seq',
+    'metrics_plain_seq_struct': 'plain_seq_struct',
+    'metrics_plain_embeddings': 'plain_embeddings',
+    'metrics_finetuned_struct': 'finetuned_struct',
+    'metrics_full_model': 'full_model',
+    'metrics_molinst_protein': 'molinst_protein',
+    'metrics_protex': 'protex',
+    # Backward compatibility with old naming
+    'rouge_plain_seq': 'plain_seq',
+    'rouge_plain_seq_struct': 'plain_seq_struct',
+    'rouge_plain_embeddings': 'plain_embeddings',
+    'rouge_finetuned_struct': 'finetuned_struct',
+    'rouge_full_model': 'full_model',
+    'rouge_molinst_protein': 'molinst_protein',
+    'rouge_protex': 'protex'
 }
 
 # Load results from each GPU
@@ -246,32 +278,21 @@ for gpu_id in range(8):
         with open(gpu_file, 'r') as f:
             gpu_data = json.load(f)
             all_results.extend(gpu_data.get('results', []))
-            # Collect ROUGE scores for recomputation
+            # Collect metric scores for recomputation
             for result in gpu_data.get('results', []):
-                for variant_num in range(1, 6):
-                    variant_key = f'variant{variant_num}'
-                    rouge_key = f'rouge_variant{variant_num}'
-                    if rouge_key in result and result[rouge_key] is not None:
-                        if variant_num == 1:
-                            all_rouge_scores['variant1_plain_seq']['rouge1'].append(result[rouge_key]['rouge1'])
-                            all_rouge_scores['variant1_plain_seq']['rouge2'].append(result[rouge_key]['rouge2'])
-                            all_rouge_scores['variant1_plain_seq']['rougeL'].append(result[rouge_key]['rougeL'])
-                        elif variant_num == 2:
-                            all_rouge_scores['variant2_plain_seq_struct']['rouge1'].append(result[rouge_key]['rouge1'])
-                            all_rouge_scores['variant2_plain_seq_struct']['rouge2'].append(result[rouge_key]['rouge2'])
-                            all_rouge_scores['variant2_plain_seq_struct']['rougeL'].append(result[rouge_key]['rougeL'])
-                        elif variant_num == 3:
-                            all_rouge_scores['variant3_plain_embeddings']['rouge1'].append(result[rouge_key]['rouge1'])
-                            all_rouge_scores['variant3_plain_embeddings']['rouge2'].append(result[rouge_key]['rouge2'])
-                            all_rouge_scores['variant3_plain_embeddings']['rougeL'].append(result[rouge_key]['rougeL'])
-                        elif variant_num == 4:
-                            all_rouge_scores['variant4_finetuned_struct']['rouge1'].append(result[rouge_key]['rouge1'])
-                            all_rouge_scores['variant4_finetuned_struct']['rouge2'].append(result[rouge_key]['rouge2'])
-                            all_rouge_scores['variant4_finetuned_struct']['rougeL'].append(result[rouge_key]['rougeL'])
-                        elif variant_num == 5:
-                            all_rouge_scores['variant5_finetuned_embeddings']['rouge1'].append(result[rouge_key]['rouge1'])
-                            all_rouge_scores['variant5_finetuned_embeddings']['rouge2'].append(result[rouge_key]['rouge2'])
-                            all_rouge_scores['variant5_finetuned_embeddings']['rougeL'].append(result[rouge_key]['rougeL'])
+                for result_key, variant_key in variant_mapping.items():
+                    if result_key in result and result[result_key]:
+                        scores = result[result_key]
+                        if 'rouge1' in scores:
+                            all_metric_scores[variant_key]['rouge1'].append(scores['rouge1'])
+                        if 'rouge2' in scores:
+                            all_metric_scores[variant_key]['rouge2'].append(scores['rouge2'])
+                        if 'rougeL' in scores:
+                            all_metric_scores[variant_key]['rougeL'].append(scores['rougeL'])
+                        if 'bleu' in scores:
+                            all_metric_scores[variant_key]['bleu'].append(scores['bleu'])
+                        if 'emji' in scores:
+                            all_metric_scores[variant_key]['emji'].append(scores['emji'])
         print(f"✅ Loaded {len(gpu_data.get('results', []))} results from GPU {gpu_id}")
     else:
         print(f"⚠️  GPU {gpu_id} output file not found: {gpu_file}")
@@ -284,33 +305,43 @@ def compute_avg(variant_scores):
         'avg_rouge1': float(np.mean(variant_scores['rouge1'])) if variant_scores['rouge1'] else 0,
         'avg_rouge2': float(np.mean(variant_scores['rouge2'])) if variant_scores['rouge2'] else 0,
         'avg_rougeL': float(np.mean(variant_scores['rougeL'])) if variant_scores['rougeL'] else 0,
+        'avg_bleu': float(np.mean(variant_scores['bleu'])) if variant_scores['bleu'] else 0,
+        'avg_emji': float(np.mean(variant_scores['emji'])) if variant_scores['emji'] else 0
     }
 
 evaluation_metrics = {
-    'variant1_plain_seq': {
-        'n_samples': len(all_rouge_scores['variant1_plain_seq']['rouge1']),
-        **compute_avg(all_rouge_scores['variant1_plain_seq'])
+    'plain_seq': {
+        'n_samples': len(all_metric_scores['plain_seq']['rouge1']),
+        **compute_avg(all_metric_scores['plain_seq'])
     },
-    'variant2_plain_seq_struct': {
-        'n_samples': len(all_rouge_scores['variant2_plain_seq_struct']['rouge1']),
-        **compute_avg(all_rouge_scores['variant2_plain_seq_struct'])
+    'plain_seq_struct': {
+        'n_samples': len(all_metric_scores['plain_seq_struct']['rouge1']),
+        **compute_avg(all_metric_scores['plain_seq_struct'])
     },
-    'variant3_plain_embeddings': {
-        'n_samples': len(all_rouge_scores['variant3_plain_embeddings']['rouge1']),
-        **compute_avg(all_rouge_scores['variant3_plain_embeddings'])
+    'plain_embeddings': {
+        'n_samples': len(all_metric_scores['plain_embeddings']['rouge1']),
+        **compute_avg(all_metric_scores['plain_embeddings'])
     },
-    'variant4_finetuned_struct': {
-        'n_samples': len(all_rouge_scores['variant4_finetuned_struct']['rouge1']),
-        **compute_avg(all_rouge_scores['variant4_finetuned_struct'])
+    'finetuned_struct': {
+        'n_samples': len(all_metric_scores['finetuned_struct']['rouge1']),
+        **compute_avg(all_metric_scores['finetuned_struct'])
     },
-    'variant5_finetuned_embeddings': {
-        'n_samples': len(all_rouge_scores['variant5_finetuned_embeddings']['rouge1']),
-        **compute_avg(all_rouge_scores['variant5_finetuned_embeddings'])
+    'full_model': {
+        'n_samples': len(all_metric_scores['full_model']['rouge1']),
+        **compute_avg(all_metric_scores['full_model'])
+    },
+    'molinst_protein': {
+        'n_samples': len(all_metric_scores['molinst_protein']['rouge1']),
+        **compute_avg(all_metric_scores['molinst_protein'])
+    },
+    'protex': {
+        'n_samples': len(all_metric_scores['protex']['rouge1']),
+        **compute_avg(all_metric_scores['protex'])
     }
 }
 
 # Save merged results
-merged_output = output_dir / output_base
+merged_output = output_dir / f"{output_base}.{output_ext}"
 merged_data = {
     'results': all_results,
     'evaluation_summary': evaluation_metrics
@@ -330,6 +361,8 @@ for variant_key, metrics in evaluation_metrics.items():
     print(f"      ROUGE-1: {metrics['avg_rouge1']:.4f}")
     print(f"      ROUGE-2: {metrics['avg_rouge2']:.4f}")
     print(f"      ROUGE-L: {metrics['avg_rougeL']:.4f}")
+    print(f"      BLEU:    {metrics['avg_bleu']:.4f}")
+    print(f"      EMJI:    {metrics['avg_emji']:.4f}")
 EOF
 
 echo ""

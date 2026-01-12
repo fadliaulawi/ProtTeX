@@ -2,11 +2,11 @@
 # Launch DDP training with torchrun for 8 GPUs
 # Requires --model argument (llama, qwen, qwen2.7, deepseek-v2, deepseek-r1, deepseek-r1-distill)
 
-# Check if model argument is provided
+# Check if model and k arguments are provided
 if [ $# -eq 0 ] || [[ ! "$*" =~ --model ]]; then
     echo "Error: --model argument is required"
     echo ""
-    echo "Usage: $0 --model <model_type> [other_args...]"
+    echo "Usage: $0 --model <model_type> --k <k_clusters> [other_args...]"
     echo ""
     echo "Available models:"
     echo "  llama              - Meta Llama 3.1 8B Instruct"
@@ -18,8 +18,19 @@ if [ $# -eq 0 ] || [[ ! "$*" =~ --model ]]; then
     echo ""
     echo "Examples:"
     echo "  $0 --model llama --k 128 --epochs 3"
-    echo "  $0 --model qwen --k 128 --epochs 3"
-    echo "  $0 --model deepseek-v2 --k 128 --epochs 3"
+    echo "  $0 --model qwen --k 1024 --epochs 5"
+    echo "  $0 --model deepseek-v2 --k 2048 --epochs 3"
+    exit 1
+fi
+
+if [[ ! "$*" =~ --k ]]; then
+    echo "Error: --k argument is required"
+    echo ""
+    echo "Usage: $0 --model <model_type> --k <k_clusters> [other_args...]"
+    echo ""
+    echo "Examples:"
+    echo "  $0 --model llama --k 128 --epochs 3"
+    echo "  $0 --model qwen --k 1024 --epochs 5"
     exit 1
 fi
 
@@ -30,13 +41,15 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # If this port is also busy, change to 29503, 29504, etc.
 MASTER_PORT=29505
 
-# Extract model name from arguments for log filename
+# Extract model name and K value from arguments for log filename
 MODEL_NAME=""
+K_VALUE=""
 prev_arg=""
 for arg in "$@"; do
     if [[ "$prev_arg" == "--model" ]]; then
         MODEL_NAME="$arg"
-        break
+    elif [[ "$prev_arg" == "--k" ]]; then
+        K_VALUE="$arg"
     fi
     prev_arg="$arg"
 done
@@ -46,8 +59,13 @@ if [ -z "$MODEL_NAME" ]; then
     MODEL_NAME="unknown"
 fi
 
+# Fallback if K value not found (shouldn't happen due to earlier check)
+if [ -z "$K_VALUE" ]; then
+    K_VALUE="unknown"
+fi
+
 # Create logs directory if it doesn't exist
-mkdir -p logs
+mkdir -p logs/ddp
 
 # Launch with torchrun (replaces torch.distributed.launch)
 torchrun \
@@ -55,7 +73,7 @@ torchrun \
     --master_port=$MASTER_PORT \
     run/05_train_lora.py \
     "$@" \
-    > logs/ddp/run_ddp_${MODEL_NAME}_$(date +%Y%m%d_%H%M%S).log 2>&1
+    > logs/ddp/run_ddp_${MODEL_NAME}_K${K_VALUE}_$(date +%Y%m%d_%H%M%S).log 2>&1
 
 # Alternative with python -m torch.distributed.launch (older style):
 # python -m torch.distributed.launch \

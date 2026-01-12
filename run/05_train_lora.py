@@ -160,7 +160,7 @@ class TriModalAlignmentModel(nn.Module):
 
 
 class ProteinFunctionDataset(Dataset):
-    """Dataset for protein function prediction with tri-modal inputs"""
+    """Dataset for protein function prediction with tri-modal inputs (type-aware)"""
     
     def __init__(self, triplets: list, metadata: list):
         """
@@ -170,11 +170,22 @@ class ProteinFunctionDataset(Dataset):
                 - structure_tokens: Interleaved tokens [seq_len]
                 - text_embedding: Model-specific [4096]
                 - protein_id: Identifier
-            metadata: List of protein metadata with raw sequences and functions
+            metadata: List of protein metadata with QA and metadata structure
         """
         self.triplets = triplets
         # Create protein_id -> metadata mapping
-        self.id_to_metadata = {m['id']: m for m in metadata} if metadata else {}
+        # Metadata structure: {"QA": {...}, "metadata": {"id": "...", "type": "...", ...}}
+        self.id_to_metadata = {}
+        if metadata:
+            for meta_entry in metadata:
+                meta_section = meta_entry.get('metadata', {})
+                qa_section = meta_entry.get('QA', {})
+                protein_id = meta_section.get('id', '')
+                if protein_id:
+                    self.id_to_metadata[protein_id] = {
+                        'QA': qa_section,
+                        'metadata': meta_section
+                    }
     
     def __len__(self):
         return len(self.triplets)
@@ -183,24 +194,30 @@ class ProteinFunctionDataset(Dataset):
         triplet = self.triplets[idx]
         protein_id = triplet['protein_id']
         
-        # Get metadata (sequence, question, and function text)
+        # Get metadata (sequence, question, and answer text)
         if protein_id in self.id_to_metadata:
             meta = self.id_to_metadata[protein_id]
-            protein_seq = meta.get('sequence', 'UNKNOWN')
-            question = meta.get('question', 'What is the function of this protein?')
-            function_text = meta.get('function', 'Unknown function')
+            qa = meta.get('QA', {})
+            meta_info = meta.get('metadata', {})
+            
+            protein_seq = qa.get('sequence', 'UNKNOWN')
+            question = qa.get('question', 'What is the function of this protein?')
+            answer = qa.get('answer', 'Unknown function')
+            protein_type = meta_info.get('type', 'PFUD')
         else:
             protein_seq = 'UNKNOWN'
             question = 'What is the function of this protein?'
-            function_text = 'Unknown function'
+            answer = 'Unknown function'
+            protein_type = 'PFUD'
         
         return {
             'sequence_emb': torch.tensor(triplet['sequence_embedding'], dtype=torch.float32),
             'structure_tokens': torch.tensor(triplet['structure_tokens'], dtype=torch.long),
             'protein_sequence': protein_seq,
             'question': question,
-            'function_text': function_text,
-            'protein_id': protein_id
+            'function_text': answer,  # Use answer as function_text
+            'protein_id': protein_id,
+            'protein_type': protein_type
         }
 
 
@@ -209,8 +226,8 @@ def load_triplet_batch(batch_file: Path, metadata_file: Path = None) -> Tuple[li
     Load triplet embeddings from script 03 output.
     
     Args:
-        batch_file: Path to triplet_embeddings_K{k}_batch_*.npz
-        metadata_file: Path to metadata JSON with protein sequences and functions
+        batch_file: Path to triplet_embeddings_batch_*.npz
+        metadata_file: Path to triplet_metadata_batch_*.json (optional)
     
     Returns:
         (train_triplets, val_triplets, metadata)
@@ -240,11 +257,7 @@ def load_triplet_batch(batch_file: Path, metadata_file: Path = None) -> Tuple[li
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
     
-    # Shuffle and split
-    shuffled_indices = np.arange(len(triplets))
-    np.random.shuffle(shuffled_indices)
-    triplets = [triplets[i] for i in shuffled_indices]
-    
+    # Split sequentially (no shuffling)
     n_val = int(len(triplets) * 0.1)
     val_triplets = triplets[:n_val]
     train_triplets = triplets[n_val:]
@@ -252,18 +265,22 @@ def load_triplet_batch(batch_file: Path, metadata_file: Path = None) -> Tuple[li
     return train_triplets, val_triplets, metadata
 
 
-def load_all_triplets(batch_files: list, k_clusters: int, metadata_dir: Path = None, rank: int = 0) -> Tuple[list, list, list]:
+def load_all_triplets(batch_files: list, metadata_dir: Path = None, 
+                      train_ratio: float = 0.9, val_ratio: float = 0.05, test_ratio: float = 0.05, 
+                      rank: int = 0) -> Tuple[list, list, list, list]:
     """
-    Load all triplet batch files at once.
+    Load all triplet batch files at once (type-aware filtering).
     
     Args:
-        batch_files: List of triplet_embeddings_K{k}_batch_*.npz paths
-        k_clusters: Number of K-means clusters
-        metadata_dir: Directory with metadata JSON files
+        batch_files: List of triplet_embeddings_batch_*.npz paths
+        metadata_dir: Directory with triplet_metadata_batch_*.json files
+        train_ratio: Ratio of training samples (default: 0.9)
+        val_ratio: Ratio of validation samples (default: 0.05)
+        test_ratio: Ratio of test samples (default: 0.05)
         rank: Process rank for distributed training (only rank 0 prints)
     
     Returns:
-        (train_triplets, val_triplets, metadata)
+        (train_triplets, val_triplets, test_triplets, metadata) - filtered to exclude PDD/PSPD
     """
     if rank == 0:
         print("\n📦 Loading all triplet files...")
@@ -273,13 +290,16 @@ def load_all_triplets(batch_files: list, k_clusters: int, metadata_dir: Path = N
     for batch_file in tqdm(batch_files, desc="Loading triplets", disable=(rank != 0)):
         try:
             # Find corresponding metadata file
-            batch_num = batch_file.stem.split('_')[-1]
-            metadata_file = metadata_dir / f'triplet_metadata_K{k_clusters}_batch_{batch_num}.json' if metadata_dir else None
+            metadata_file = None
+            if metadata_dir:
+                if 'batch_' in batch_file.stem:
+                    batch_part = batch_file.stem.split('batch_')[-1]  # Get '36' part
+                    metadata_file = metadata_dir / f'triplet_metadata_batch_{batch_part}.json'
             
             # Warn if metadata file doesn't exist
             if metadata_file and not metadata_file.exists():
                 if rank == 0:
-                    print(f"\n⚠️  Metadata file not found for batch {batch_num}: {metadata_file.name}")
+                    print(f"\n⚠️  Metadata file not found for batch {batch_file.stem}: {metadata_file.name}")
             
             train_triplets, val_triplets, metadata = load_triplet_batch(batch_file, metadata_file)
             all_triplets.extend(train_triplets + val_triplets)
@@ -292,24 +312,56 @@ def load_all_triplets(batch_files: list, k_clusters: int, metadata_dir: Path = N
     if rank == 0:
         print(f"✅ Loaded {len(all_triplets):,} total triplets")
         print(f"✅ Loaded {len(all_metadata):,} metadata entries")
+    
+    # Type-aware filtering: create protein_id -> type mapping
+    # Filter out PDD/PSPD types (where answer == sequence, not meaningful text)
+    protein_id_to_type = {}
+    for meta_entry in all_metadata:
+        meta_section = meta_entry.get('metadata', {})
+        protein_id = meta_section.get('id', '')
+        protein_type = meta_section.get('type', 'PFUD')
+        if protein_id:
+            protein_id_to_type[protein_id] = protein_type
+    
+    # Filter triplets: only keep PFUD/PSAD (skip PDD/PSPD)
+    filtered_triplets = []
+    skipped_count = 0
+    type_counts = {'PFUD': 0, 'PSAD': 0, 'PDD': 0, 'PSPD': 0}
+    
+    for triplet in all_triplets:
+        protein_id = triplet['protein_id']
+        protein_type = protein_id_to_type.get(protein_id, 'PFUD')
+        type_counts[protein_type] = type_counts.get(protein_type, 0) + 1
         
-        # Shuffle all
-        print("\n🔀 Shuffling dataset...")
-    
-    shuffled_indices = np.arange(len(all_triplets))
-    np.random.shuffle(shuffled_indices)
-    all_triplets = [all_triplets[i] for i in shuffled_indices]
-    
-    # Split train/val
-    n_val = int(len(all_triplets) * 0.1)
-    val_triplets = all_triplets[:n_val]
-    train_triplets = all_triplets[n_val:]
+        # Skip PDD/PSPD types (answer is sequence, not meaningful text)
+        if protein_type in ['PDD', 'PSPD']:
+            skipped_count += 1
+            continue
+        
+        filtered_triplets.append(triplet)
     
     if rank == 0:
-        print(f"   Train: {len(train_triplets):,} samples")
-        print(f"   Val:   {len(val_triplets):,} samples")
+        print(f"\n📊 Type distribution (before filtering):")
+        for ptype, count in sorted(type_counts.items()):
+            print(f"   {ptype}: {count:,}")
+        print(f"\n🔍 Filtered out {skipped_count:,} PDD/PSPD samples (answer == sequence)")
+        print(f"✅ Keeping {len(filtered_triplets):,} PFUD/PSAD samples for training")
     
-    return train_triplets, val_triplets, all_metadata
+    # Split train/val/test sequentially (90/5/5) - no shuffling
+    total = len(filtered_triplets)
+    n_train = int(total * train_ratio)
+    n_val = int(total * val_ratio)
+    
+    train_triplets = filtered_triplets[:n_train]
+    val_triplets = filtered_triplets[n_train:n_train + n_val]
+    test_triplets = filtered_triplets[n_train + n_val:]
+    
+    if rank == 0:
+        print(f"   Train: {len(train_triplets):,} samples ({100*len(train_triplets)/total:.1f}%)")
+        print(f"   Val:   {len(val_triplets):,} samples ({100*len(val_triplets)/total:.1f}%)")
+        print(f"   Test:  {len(test_triplets):,} samples ({100*len(test_triplets)/total:.1f}%)")
+    
+    return train_triplets, val_triplets, test_triplets, all_metadata
 
 
 class TriModalTrainer:
@@ -642,6 +694,11 @@ class TriModalTrainer:
 
 
 def main():
+    # Hardcoded train/val/test split ratios (90/5/5)
+    TRAIN_RATIO = 0.9
+    VAL_RATIO = 0.05
+    TEST_RATIO = 0.05
+    
     # Setup distributed training
     rank, world_size, local_rank = setup_distributed()
     
@@ -652,12 +709,10 @@ def main():
     parser.add_argument('--model', type=str, required=True,
                        choices=list_available_models(),
                        help=f'Model type: {", ".join(list_available_models())}')
-    parser.add_argument('--k', type=int, default=128,
+    parser.add_argument('--k', type=int, required=True,
                        help='K-means clusters (must match script 04)')
     parser.add_argument('--epochs', type=int, default=3,
                        help='Training epochs (default: 3)')
-    parser.add_argument('--test-batches', type=int, default=4,
-                       help='Number of last batches to hold out for testing (default: 4)')
     
     args = parser.parse_args()
     
@@ -691,8 +746,8 @@ def main():
         # Initialize wandb
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         wandb.init(
-            project=model_config.wandb_project,
-            name=f"run-{args.model}-lora-ddp-{timestamp}",
+            project='prottex-lora',
+            name=f"run-{args.model}-lora-K{k_clusters}-ddp-{timestamp}",
             config={
                 'k_clusters': k_clusters,
                 'epochs': args.epochs,
@@ -719,10 +774,11 @@ def main():
         for i in range(world_size):
             print(f"   GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)")
     
-    # Use model-specific directories
-    triplet_dir = Path(f'data/triplet_embeddings/{args.model}')
+    # Use model-specific directories with K{k_clusters} subdirectory
+    triplet_dir = Path(f'data/triplet_embeddings/{args.model}/K{k_clusters}')
+    metadata_dir = triplet_dir
     alignment_dir = Path(f'data/clip_alignment/{args.model}_K{k_clusters}')
-    output_dir = Path(f'data/lora/{model_config.output_dir_suffix}/K{k_clusters}_test{args.test_batches}')
+    output_dir = Path(f'data/lora/{model_config.output_dir_suffix}/K{k_clusters}')
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if rank == 0:
@@ -830,7 +886,7 @@ def main():
         print("STEP 3: Load Triplet Data")
         print("=" * 70)
     
-    all_batch_files = sorted(triplet_dir.glob(f"triplet_embeddings_K{k_clusters}_batch_*.npz"))
+    all_batch_files = sorted(triplet_dir.glob(f"triplet_embeddings_batch_*.npz"))
     if not all_batch_files:
         if rank == 0:
             print(f"❌ No triplet files found")
@@ -838,19 +894,10 @@ def main():
         cleanup_distributed()
         return
     
-    # Exclude last N batches for held-out test set
-    test_batches = args.test_batches
-    if test_batches > 0 and test_batches < len(all_batch_files):
-        batch_files = all_batch_files[:-test_batches]  # Training batches
-        test_batch_files = all_batch_files[-test_batches:]  # Held-out test batches
-        if rank == 0:
-            print(f"✅ Found {len(all_batch_files)} total batch files")
-            print(f"   📚 Training batches: {len(batch_files)} (batch 0-{len(batch_files)-1})")
-            print(f"   🧪 Held-out test batches: {len(test_batch_files)} (batch {len(batch_files)}-{len(all_batch_files)-1})")
-    else:
-        batch_files = all_batch_files
-        if rank == 0:
-            print(f"✅ Found {len(batch_files)} batch files (no held-out test set)")
+    batch_files = all_batch_files
+    if rank == 0:
+        print(f"✅ Found {len(batch_files)} batch files")
+        print(f"📊 Data split: Train={TRAIN_RATIO*100:.0f}%, Val={VAL_RATIO*100:.0f}%, Test={TEST_RATIO*100:.0f}%")
     
     # Train
     if rank == 0:
@@ -892,7 +939,53 @@ def main():
             print(f"{'='*70}")
         
         # Load all triplets for this epoch
-        train_triplets, val_triplets, metadata = load_all_triplets(batch_files, k_clusters, triplet_dir, rank)
+        train_triplets, val_triplets, test_triplets, metadata = load_all_triplets(
+            batch_files, metadata_dir, TRAIN_RATIO, VAL_RATIO, TEST_RATIO, rank
+        )
+        
+        # Save test data for evaluation (only in first epoch, only rank 0)
+        if epoch == 0 and rank == 0:
+            # Create evaluation directory
+            eval_dir = Path(f'data/evaluation/{args.model}/K{k_clusters}')
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create protein_id -> full metadata mapping
+            protein_id_to_full_metadata = {}
+            for meta_entry in metadata:
+                meta_section = meta_entry.get('metadata', {})
+                qa_section = meta_entry.get('QA', {})
+                protein_id = meta_section.get('id', '')
+                if protein_id:
+                    protein_id_to_full_metadata[protein_id] = {
+                        'QA': qa_section,
+                        'metadata': meta_section
+                    }
+            
+            # Convert test_triplets to inference format (same format as script 06 expects)
+            test_data = []
+            for triplet in test_triplets:
+                protein_id = triplet['protein_id']
+                if protein_id in protein_id_to_full_metadata:
+                    meta = protein_id_to_full_metadata[protein_id]
+                    qa = meta.get('QA', {})
+                    meta_info = meta.get('metadata', {})
+                    
+                    test_data.append({
+                        'id': protein_id,
+                        'sequence': qa.get('sequence', ''),
+                        'question': qa.get('question', ''),
+                        'function': qa.get('answer', ''),
+                        'type': meta_info.get('type', 'PFUD'),
+                        'subset': meta_info.get('subset', '')
+                    })
+            
+            # Save test data
+            test_data_path = eval_dir / 'test_data.json'
+            with open(test_data_path, 'w') as f:
+                json.dump(test_data, f, indent=2)
+            
+            print(f"\n💾 Saved test data: {test_data_path}")
+            print(f"   Test samples: {len(test_data)}")
         
         train_dataset = ProteinFunctionDataset(train_triplets, metadata)
         val_dataset = ProteinFunctionDataset(val_triplets, metadata)
@@ -965,8 +1058,9 @@ def main():
             'model': model_config.model_name,
             'model_type': args.model,
             'train_batches': len(batch_files),
-            'test_batches_held_out': args.test_batches,
-            'test_batch_range': f"{len(batch_files)}-{len(batch_files) + args.test_batches - 1}" if args.test_batches > 0 else None
+            'train_ratio': TRAIN_RATIO,
+            'val_ratio': VAL_RATIO,
+            'test_ratio': TEST_RATIO
         }
         
         config_out_path = output_dir / f'config_K{k_clusters}.json'
@@ -980,7 +1074,6 @@ def main():
     
     # Cleanup distributed
     cleanup_distributed()
-
 
 if __name__ == '__main__':
     main()
