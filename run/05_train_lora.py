@@ -347,7 +347,10 @@ def load_all_triplets(batch_files: list, metadata_dir: Path = None,
         print(f"\n🔍 Filtered out {skipped_count:,} PDD/PSPD samples (answer == sequence)")
         print(f"✅ Keeping {len(filtered_triplets):,} PFUD/PSAD samples for training")
     
-    # Split train/val/test sequentially (90/5/5) - no shuffling
+    # Shuffle before splitting train/val/test (90/5/5)
+    np.random.shuffle(filtered_triplets)
+    
+    # Split train/val/test (90/5/5)
     total = len(filtered_triplets)
     n_train = int(total * train_ratio)
     n_val = int(total * val_ratio)

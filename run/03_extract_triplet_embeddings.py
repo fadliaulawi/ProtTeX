@@ -218,6 +218,33 @@ def main():
     
     data_dir = Path('data')
     embeddings_dir = data_dir / 'esm_embeddings'
+    
+    # Check for existing triplet embeddings to reuse (no race condition check)
+    triplet_base_dir = data_dir / 'triplet_embeddings' / args.model
+    reuse_source_k = None
+    
+    if triplet_base_dir.exists():
+        # Find all existing K directories
+        existing_k_dirs = [d for d in triplet_base_dir.iterdir() if d.is_dir() and d.name.startswith('K')]
+        if existing_k_dirs:
+            # Extract K values
+            existing_ks = []
+            for d in existing_k_dirs:
+                try:
+                    k_val = int(d.name[1:])  # Remove 'K' prefix
+                    if k_val != k_clusters:  # Skip target K
+                        existing_ks.append(k_val)
+                except ValueError:
+                    continue
+            
+            if existing_ks:
+                # Find the largest K (excluding target)
+                max_k = max(existing_ks)
+                print(f"\n🔍 Found existing triplet embeddings for model '{args.model}':")
+                print(f"   Available K values: {sorted(existing_ks)}")
+                print(f"   Will reuse from K={max_k}")
+                reuse_source_k = max_k
+    
     # Use model-specific output directory
     output_dir = data_dir / 'triplet_embeddings' / args.model / f'K{k_clusters}'
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -228,6 +255,8 @@ def main():
     print(f"📌 Data directory: {data_dir}")
     print(f"📌 Embeddings directory: {embeddings_dir}")
     print(f"📌 Output directory: {output_dir}")
+    if reuse_source_k:
+        print(f"📌 Reusing seq/text embeddings from K={reuse_source_k} (faster!)")
     
     # Calculate vocabulary size dynamically
     vocab_size = 20 + k_clusters + 5
@@ -281,33 +310,40 @@ def main():
     
     print(f"✅ Loaded {len(proteins)} proteins from dataset")
     
-    # Load Models
+    # Load Models (skip ESM-2 and text model if reusing)
     print("\n" + "=" * 70)
     print("STEP 2: Loading Models")
     print("=" * 70)
     
-    print(f"Loading ESM-2 3B for sequence embeddings: {ESM_SEQ_MODEL_NAME}...")
-    esm_tokenizer = AutoTokenizer.from_pretrained(ESM_SEQ_MODEL_NAME)
-    esm_model = EsmModel.from_pretrained(ESM_SEQ_MODEL_NAME)
-    esm_model = esm_model.to(device)
-    esm_model.eval()
-    print(f"✅ ESM-2 3B loaded (dim: {esm_model.config.hidden_size})")
-    
-    print(f"Loading {args.model} model {TEXT_MODEL_NAME}...")
-    text_tokenizer = AutoTokenizer.from_pretrained(
-        TEXT_MODEL_NAME,
-        trust_remote_code=model_config.trust_remote_code
-    )
-    if text_tokenizer.pad_token is None:
-        text_tokenizer.pad_token = text_tokenizer.eos_token
-    text_model = AutoModel.from_pretrained(
-        TEXT_MODEL_NAME,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=model_config.trust_remote_code
-    )
-    text_model.eval()
-    print(f"✅ {args.model} loaded (dim: {text_model.config.hidden_size})")
+    if reuse_source_k:
+        print(f"⚡ Skipping ESM-2 and text model (reusing embeddings from K={reuse_source_k})")
+        esm_model = None
+        esm_tokenizer = None
+        text_model = None
+        text_tokenizer = None
+    else:
+        print(f"Loading ESM-2 3B for sequence embeddings: {ESM_SEQ_MODEL_NAME}...")
+        esm_tokenizer = AutoTokenizer.from_pretrained(ESM_SEQ_MODEL_NAME)
+        esm_model = EsmModel.from_pretrained(ESM_SEQ_MODEL_NAME)
+        esm_model = esm_model.to(device)
+        esm_model.eval()
+        print(f"✅ ESM-2 3B loaded (dim: {esm_model.config.hidden_size})")
+        
+        print(f"Loading {args.model} model {TEXT_MODEL_NAME}...")
+        text_tokenizer = AutoTokenizer.from_pretrained(
+            TEXT_MODEL_NAME,
+            trust_remote_code=model_config.trust_remote_code
+        )
+        if text_tokenizer.pad_token is None:
+            text_tokenizer.pad_token = text_tokenizer.eos_token
+        text_model = AutoModel.from_pretrained(
+            TEXT_MODEL_NAME,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=model_config.trust_remote_code
+        )
+        text_model.eval()
+        print(f"✅ {args.model} loaded (dim: {text_model.config.hidden_size})")
     
     # Load k-means codebook
     print(f"Loading k-means codebook from {codebook_path}...")
@@ -322,10 +358,80 @@ def main():
     print("STEP 3: Extracting Embedding Triplets (Batch Mode)")
     print("=" * 70)
     
+    # If reusing, set up source directory
+    if reuse_source_k:
+        source_dir = data_dir / 'triplet_embeddings' / args.model / f'K{reuse_source_k}'
+        print(f"⚡ Source directory for reuse: {source_dir}")
+    
     total_triplets = 0
     total_skipped = 0
     
-    for batch_num in range(batch_start, batch_end):
+    for batch_num in tqdm(range(batch_start, batch_end), desc="Processing batches"):
+        # REUSE MODE: Load from existing K and only regenerate structure tokens
+        if reuse_source_k:
+            source_npz_file = source_dir / f'triplet_embeddings_batch_{batch_num}.npz'
+            source_json_file = source_dir / f'triplet_metadata_batch_{batch_num}.json'
+            
+            if not source_npz_file.exists() or not source_json_file.exists():
+                continue
+            
+            # Load existing embeddings and metadata
+            source_data = np.load(source_npz_file, allow_pickle=True)
+            with open(source_json_file, 'r') as f:
+                source_metadata = json.load(f)
+            
+            # Reuse sequence and text embeddings
+            sequence_embeddings = source_data['sequence_embeddings']
+            text_embeddings = source_data['text_embeddings']
+            protein_ids = source_data['protein_ids']
+            protein_indices = source_data['protein_indices']
+            
+            # Get sequences from metadata
+            sequences = [item['QA']['sequence'] for item in source_metadata]
+            
+            # Load ESMFold embeddings to regenerate structure tokens
+            embeddings_file = embeddings_dir / f'esm_embeddings_batch_{batch_num}.npy'
+            if not embeddings_file.exists():
+                continue
+            
+            all_embeddings = np.load(embeddings_file)
+            
+            # Regenerate structure tokens with new K
+            new_structure_tokens = []
+            emb_offset = 0
+            
+            for seq in sequences:
+                seq_length = len(seq)
+                protein_embeddings = all_embeddings[emb_offset:emb_offset + seq_length]
+                emb_offset += seq_length
+                
+                struct_tokens = extract_structure_tokens_from_embeddings(
+                    seq, protein_embeddings, kmeans, k_clusters
+                )
+                new_structure_tokens.append(struct_tokens)
+            
+            structure_tokens_array = np.stack(new_structure_tokens)
+            
+            # Save with new K
+            output_file = output_dir / f'triplet_embeddings_batch_{batch_num}.npz'
+            np.savez_compressed(
+                output_file,
+                sequence_embeddings=sequence_embeddings,
+                text_embeddings=text_embeddings,
+                protein_ids=protein_ids,
+                protein_indices=protein_indices,
+                structure_tokens=structure_tokens_array
+            )
+            
+            # Copy metadata
+            output_json_file = output_dir / f'triplet_metadata_batch_{batch_num}.json'
+            with open(output_json_file, 'w') as f:
+                json.dump(source_metadata, f, indent=2)
+            
+            total_triplets += len(sequences)
+            continue
+        
+        # FULL EXTRACTION MODE: Extract all embeddings from scratch
         print(f"\n{'='*70}")
         print(f"Processing Batch {batch_num}")
         print(f"{'='*70}")

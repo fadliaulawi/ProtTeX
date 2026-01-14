@@ -698,14 +698,15 @@ def main():
     print(f"      - PFUD/PSAD: seq-text + struct-text + seq-struct + consistency")
     print(f"      - PDD/PSPD: seq-struct only\n")
     
+    # Load all batch files once (not per epoch!)
+    train_triplets, val_triplets = load_all_batch_files(batch_files, metadata_dir)
+    print("✅ Dataset loaded. Train/val split is fixed across all epochs.\n")
+    
     # Global epoch loop
     for global_epoch in range(args.epochs):
         print(f"\n{'='*70}")
         print(f"GLOBAL EPOCH {global_epoch + 1}/{args.epochs}")
         print(f"{'='*70}")
-        
-        # Load all batch files at the start of each epoch
-        train_triplets, val_triplets = load_all_batch_files(batch_files, metadata_dir)
         
         # Create datasets and loaders
         train_dataset = TripletEmbeddingDataset(train_triplets)

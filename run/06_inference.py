@@ -1320,7 +1320,7 @@ def main():
                 result["predicted_function_plain_seq"] = pred_v1
                 if gt and pred_v1 and not pred_v1.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v1)
-                    bleu_score = compute_bleu(gt, pred_v1, n=4)
+                    bleu_score = compute_bleu(gt, pred_v1, n=2)
                     emji_score = compute_emji(gt, pred_v1)
                     result['metrics_plain_seq'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1357,7 +1357,7 @@ def main():
                 result["predicted_function_plain_seq_struct"] = pred_v2
                 if gt and pred_v2 and not pred_v2.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v2)
-                    bleu_score = compute_bleu(gt, pred_v2, n=4)
+                    bleu_score = compute_bleu(gt, pred_v2, n=2)
                     emji_score = compute_emji(gt, pred_v2)
                     result['metrics_plain_seq_struct'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1394,7 +1394,7 @@ def main():
                 result["predicted_function_plain_embeddings"] = pred_v3
                 if gt and pred_v3 and not pred_v3.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v3)
-                    bleu_score = compute_bleu(gt, pred_v3, n=4)
+                    bleu_score = compute_bleu(gt, pred_v3, n=2)
                     emji_score = compute_emji(gt, pred_v3)
                     result['metrics_plain_embeddings'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1431,7 +1431,7 @@ def main():
                 result["predicted_function_finetuned_struct"] = pred_v4
                 if gt and pred_v4 and not pred_v4.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v4)
-                    bleu_score = compute_bleu(gt, pred_v4, n=4)
+                    bleu_score = compute_bleu(gt, pred_v4, n=2)
                     emji_score = compute_emji(gt, pred_v4)
                     result['metrics_finetuned_struct'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1468,7 +1468,7 @@ def main():
                 result["predicted_function_full_model"] = pred_v5
                 if gt and pred_v5 and not pred_v5.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v5)
-                    bleu_score = compute_bleu(gt, pred_v5, n=4)
+                    bleu_score = compute_bleu(gt, pred_v5, n=2)
                     emji_score = compute_emji(gt, pred_v5)
                     result['metrics_full_model'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1505,7 +1505,7 @@ def main():
                 result["predicted_function_molinst_protein"] = pred_v6
                 if gt and pred_v6 and not pred_v6.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v6)
-                    bleu_score = compute_bleu(gt, pred_v6, n=4)
+                    bleu_score = compute_bleu(gt, pred_v6, n=2)
                     emji_score = compute_emji(gt, pred_v6)
                     result['metrics_molinst_protein'] = {
                         'rouge1': scores['rouge1'].fmeasure,
@@ -1542,7 +1542,7 @@ def main():
                 result["predicted_function_protex"] = pred_v7
                 if gt and pred_v7 and not pred_v7.startswith('ERROR'):
                     scores = scorer.score(gt, pred_v7)
-                    bleu_score = compute_bleu(gt, pred_v7, n=4)
+                    bleu_score = compute_bleu(gt, pred_v7, n=2)
                     emji_score = compute_emji(gt, pred_v7)
                     result['metrics_protex'] = {
                         'rouge1': scores['rouge1'].fmeasure,
